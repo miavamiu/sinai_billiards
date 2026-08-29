@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+*.csv
+sinai_results*
+.DS_Store
+Thumbs.db
+.gitignore.txt
+gitignore.txt
