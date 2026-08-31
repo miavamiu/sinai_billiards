@@ -5,8 +5,9 @@
   What is a Sinai billiard?
   -------------------------
   A point "ball" flies in a straight line inside a board (rectangle, circle,
-  or a polar curve). Optionally there is an obstacle (prepyatstvie / scatterer)
-  inside; you can also run with obstacle = "none" (empty table).
+  ellipse, or a polar curve). Optionally there is an obstacle
+  (prepyatstvie / scatterer) inside; you can also run with
+  obstacle = "none" (empty table).
   When the ball hits a wall or the obstacle, it bounces elastically:
   angle of incidence = angle of reflection.
 
@@ -14,10 +15,10 @@
   a tiny change in the start angle can create a totally different path.
 
   What YOU can control:
-    - board shape: rectangle, circle, or polar curve
+    - board shape: rectangle, circle, ellipse, or polar curve
       polar: r(θ) = r0 + a1 cosθ + b1 sinθ + a2 cos2θ + b2 sin2θ + ...
       (useful for studying bounce behaviour at small iteration counts)
-    - side ratio of the rectangle (width / height)
+    - side ratio of the rectangle / ellipse (width / height)
     - obstacle shape (or "none" = empty table, no scatterer)
     - obstacle size and placement (when an obstacle is present)
     - ball start position and start angle ONLY (speed is always 1)
@@ -58,11 +59,11 @@ class Config:
     """All settings in one place. A dataclass is just a named box of values."""
 
     # ----- BOARD -----
-    # Allowed: "rectangle", "circle", or "polar"
+    # Allowed: "rectangle", "circle", "ellipse", or "polar"
     board_shape: str = "rectangle"
 
-    # Rectangle only: width = ratio * height
-    #   1.0 -> square,  2.0 -> twice as wide as tall
+    # Rectangle / ellipse only: width = ratio * height
+    #   1.0 -> square (or circle),  2.0 -> twice as wide as tall
     # Circle / polar board: this value is ignored
     board_ratio: float = 1.5
 
@@ -70,14 +71,17 @@ class Config:
     #   rectangle -> half-height  (full height = 2*board_size,
     #                              full width  = 2*board_size*board_ratio)
     #   circle    -> radius
+    #   ellipse   -> vertical radius (horizontal radius = board_size*board_ratio)
     #   polar     -> ignored (use polar_r0 / polar_a* / polar_b* below)
     board_size: float = 1.0
 
     # Polar board: r(θ) = r0 + a1 cosθ + b1 sinθ
     #                    + a2 cos2θ + b2 sin2θ
     #                    + a3 cos3θ + b3 sin3θ
-    # Require r(θ) > 0 for all θ (star-shaped domain around the origin).
+    # Require r(θ) >= 0 for all θ (star-shaped domain around the origin).
+    # r(θ) = 0 at one angle is allowed and means a CUSP there.
     # Example limaçon-ish: r0=1, a1=0.3, rest 0
+    # Cardioid (proven fully chaotic): r0=1, a1=1, rest 0
     polar_r0: float = 1.0
     polar_a1: float = 0.0
     polar_b1: float = 0.0
@@ -135,11 +139,17 @@ CFG = Config()
 def board_half_extents(cfg: Config):
     """
     Return (half_width, half_height) of the rectangular board.
+    For an ellipse board these same two numbers are its radii (rx, ry).
     For a circle / polar board we still use this as a drawing bounding box helper.
     """
     half_h = cfg.board_size
     half_w = cfg.board_size * cfg.board_ratio
     return half_w, half_h
+
+
+def board_ellipse_radii(cfg: Config):
+    """Return (rx, ry): horizontal and vertical radii of an ellipse board."""
+    return board_half_extents(cfg)
 
 
 def polar_radius(theta, cfg: Config) -> float:
@@ -184,22 +194,47 @@ def polar_inward_normal(theta, cfg: Config):
     return nx / length, ny / length
 
 
-def max_polar_radius(cfg: Config, samples: int = 720) -> float:
-    """Largest r(θ) over a dense sample (for window scaling / ray search)."""
-    best = 0.0
+def polar_coefficients(cfg: Config):
+    """The 7 numbers that fully define the polar curve r(θ)."""
+    return (
+        cfg.polar_r0,
+        cfg.polar_a1, cfg.polar_b1,
+        cfg.polar_a2, cfg.polar_b2,
+        cfg.polar_a3, cfg.polar_b3,
+    )
+
+
+# r(θ) extrema depend only on the 7 coefficients, but hit_polar_board needs
+# max_polar_radius on EVERY collision. Sampling 720 points each time made the
+# chaos survey unusably slow, so remember the answer per coefficient set.
+_POLAR_EXTREMA_CACHE = {}
+
+
+def _polar_extrema(cfg: Config, samples: int):
+    """Return (min r, max r) over a dense sample, cached per curve."""
+    key = (polar_coefficients(cfg), samples)
+    hit = _POLAR_EXTREMA_CACHE.get(key)
+    if hit is not None:
+        return hit
+    lo = float("inf")
+    hi = 0.0
     for i in range(samples):
         theta = 2.0 * math.pi * i / samples
-        best = max(best, polar_radius(theta, cfg))
-    return best
+        r = polar_radius(theta, cfg)
+        lo = min(lo, r)
+        hi = max(hi, r)
+    _POLAR_EXTREMA_CACHE[key] = (lo, hi)
+    return lo, hi
+
+
+def max_polar_radius(cfg: Config, samples: int = 720) -> float:
+    """Largest r(θ) over a dense sample (for window scaling / ray search)."""
+    return _polar_extrema(cfg, samples)[1]
 
 
 def min_polar_radius(cfg: Config, samples: int = 720) -> float:
     """Smallest r(θ) over a dense sample (must stay > 0)."""
-    best = float("inf")
-    for i in range(samples):
-        theta = 2.0 * math.pi * i / samples
-        best = min(best, polar_radius(theta, cfg))
-    return best
+    return _polar_extrema(cfg, samples)[0]
 
 
 def board_world_half_size(cfg: Config):
@@ -209,6 +244,8 @@ def board_world_half_size(cfg: Config):
     if cfg.board_shape == "circle":
         R = cfg.board_size
         return R, R
+    if cfg.board_shape == "ellipse":
+        return board_ellipse_radii(cfg)
     if cfg.board_shape == "polar":
         R = max_polar_radius(cfg)
         return R, R
@@ -222,13 +259,99 @@ def point_inside_board(x, y, cfg: Config) -> bool:
         return abs(x) < hw and abs(y) < hh
     if cfg.board_shape == "circle":
         return x * x + y * y < cfg.board_size * cfg.board_size
+    if cfg.board_shape == "ellipse":
+        rx, ry = board_ellipse_radii(cfg)
+        if rx <= 0 or ry <= 0:
+            return False
+        return (x / rx) ** 2 + (y / ry) ** 2 < 1.0
     if cfg.board_shape == "polar":
         rho = math.hypot(x, y)
         if rho < 1e-15:
-            return True  # origin is inside a star-shaped polar domain
+            # The origin is interior only when the curve never reaches it.
+            # On a cusped board (e.g. the cardioid) the cusp sits ON the
+            # origin, so the origin is a boundary point, not free space.
+            return min_polar_radius(cfg) > 0.0
         theta = math.atan2(y, x)
         return rho < polar_radius(theta, cfg)
     raise ValueError("Unknown board_shape: " + str(cfg.board_shape))
+
+
+def boundary_distance(cfg: Config, theta: float) -> float:
+    """
+    Distance from the board centre (0, 0) out to the wall along direction theta.
+
+    Found by bisection on point_inside_board, so it works for every board shape
+    (including ones added later) without shape-specific formulas. Returns 0.0
+    when there is no free space in that direction at all - which happens on a
+    cusped board like the cardioid, exactly along the cusp.
+    """
+    c = math.cos(theta)
+    s = math.sin(theta)
+    hw, hh = board_world_half_size(cfg)
+    far = math.hypot(hw, hh) * 1.5 + 1.0   # certainly outside the board
+
+    # Halve inward until we land inside. Every board here is star-shaped about
+    # the centre, so the inside radii form one interval [0, R).
+    lo = None
+    probe = far
+    for _ in range(80):
+        probe *= 0.5
+        if point_inside_board(probe * c, probe * s, cfg):
+            lo = probe
+            break
+    if lo is None:
+        return 0.0
+
+    hi = far
+    for _ in range(60):
+        mid = 0.5 * (lo + hi)
+        if point_inside_board(mid * c, mid * s, cfg):
+            lo = mid
+        else:
+            hi = mid
+    return lo
+
+
+# 360 * (1 - 1/phi). Successive multiples of this angle never repeat a
+# direction and never line up with the symmetry axes at 0/45/90/... degrees.
+GOLDEN_ANGLE_DEG = 137.50776405003785
+
+
+def spread_start_points(cfg: Config, n_points: int = 5, fill: float = 0.92):
+    """
+    Pick n_points start positions spread over the board on a golden-angle
+    ("sunflower") spiral: point k sits at angle (k+0.5)*137.5 deg and at
+    sqrt((k+0.5)/n) of the way to the wall along that direction.
+
+    Why this pattern rather than named spots like the centre and the corners:
+
+      - The golden angle is irrational against a full turn, so no point ever
+        lands on a symmetry axis. Symmetry positions sample special orbit
+        families; measured against area-sampled points they understated the
+        real spread of the chaoticness score by about 5x.
+      - The sqrt radial spacing makes the points uniform BY AREA, so the set
+        is representative instead of bunched near the middle.
+      - No point sits at the exact centre, which is both a symmetry point and,
+        on a cusped board like the cardioid, not even inside the board.
+      - Each radius is scaled by the wall distance in its own direction, so
+        the spread adapts to lopsided boards.
+    """
+    n = max(1, int(n_points))
+    points = []
+    for k in range(n):
+        theta = math.radians(GOLDEN_ANGLE_DEG * (k + 0.5))
+        reach = boundary_distance(cfg, theta)
+        if reach <= 0.0:
+            continue
+        radius = fill * math.sqrt((k + 0.5) / n) * reach
+        x = radius * math.cos(theta)
+        y = radius * math.sin(theta)
+        if not point_inside_board(x, y, cfg):
+            continue
+        if point_inside_obstacle(x, y, cfg):
+            continue
+        points.append((x, y))
+    return points
 
 
 def point_inside_obstacle(x, y, cfg: Config) -> bool:
@@ -260,12 +383,26 @@ def point_inside_obstacle(x, y, cfg: Config) -> bool:
 def validate_start(cfg: Config):
     """Crash early with a clear message if the start point is illegal."""
     if cfg.board_shape == "polar":
+        # r(θ) = 0 at a single angle is a CUSP, which is allowed: it is what
+        # makes the cardioid (r0=1, a1=1) - a billiard proven fully chaotic -
+        # expressible here. Only a NEGATIVE radius is rejected, because that
+        # flips points through the origin and no longer describes a simple
+        # closed boundary.
         r_min = min_polar_radius(cfg)
-        if r_min <= 0:
+        if r_min < -1e-12:
             raise ValueError(
-                "Polar board has r(θ) <= 0 somewhere (min ≈ {:.4f}). "
+                "Polar board has r(theta) < 0 somewhere (min = {:.4f}). "
+                "A negative radius does not describe a closed boundary. "
                 "Increase polar_r0 or reduce the a/b coefficients "
-                "so the curve stays positive.".format(r_min)
+                "(r(theta) = 0 at one angle is fine - that is a cusp)."
+                .format(r_min)
+            )
+    if cfg.board_shape == "ellipse":
+        rx, ry = board_ellipse_radii(cfg)
+        if rx <= 0 or ry <= 0:
+            raise ValueError(
+                "Ellipse board needs positive radii (got rx = {:.4f}, ry = {:.4f}). "
+                "Make board_size and board_ratio positive.".format(rx, ry)
             )
     if not point_inside_board(cfg.start_x, cfg.start_y, cfg):
         raise ValueError(
@@ -397,6 +534,42 @@ def hit_circle_board(x, y, vx, vy, cfg: Config):
     return (t, -hx / length, -hy / length)
 
 
+def hit_ellipse_board(x, y, vx, vy, cfg: Config):
+    """
+    Next hit with an axis-aligned elliptical outer wall
+    (radii rx = board_size*board_ratio, ry = board_size).
+
+    Same trick as the ellipse obstacle: scale space so the ellipse becomes the
+    unit circle, solve the quadratic there, then map the normal back.
+    """
+    rx, ry = board_ellipse_radii(cfg)
+    if rx <= 0 or ry <= 0:
+        return None
+
+    px = x / rx
+    py = y / ry
+    svx = vx / rx
+    svy = vy / ry
+
+    a = svx * svx + svy * svy
+    b = 2.0 * (px * svx + py * svy)
+    c = px * px + py * py - 1.0
+    t = earliest_positive(solve_quadratic(a, b, c))
+    if t is None:
+        return None
+
+    hx = px + t * svx
+    hy = py + t * svy
+    # Gradient mapped back to world coordinates points OUT of the board;
+    # the bounce formula needs the INWARD normal, so flip the sign.
+    nx = -hx / rx
+    ny = -hy / ry
+    length = math.hypot(nx, ny)
+    if length < 1e-15:
+        return None
+    return (t, nx / length, ny / length)
+
+
 def _polar_signed_gap(x, y, vx, vy, t, cfg: Config) -> float:
     """
     f(t) = |P(t)| - r(arg P(t)).
@@ -473,6 +646,8 @@ def next_board_hit(x, y, vx, vy, cfg: Config):
         return hit_rectangle_board(x, y, vx, vy, cfg)
     if cfg.board_shape == "circle":
         return hit_circle_board(x, y, vx, vy, cfg)
+    if cfg.board_shape == "ellipse":
+        return hit_ellipse_board(x, y, vx, vy, cfg)
     if cfg.board_shape == "polar":
         return hit_polar_board(x, y, vx, vy, cfg)
     raise ValueError("Unknown board_shape: " + str(cfg.board_shape))
@@ -983,6 +1158,11 @@ def _draw_board_and_obstacle(canvas, cfg: Config, scale, cx, cy):
         x0, y0 = world_to_screen(-R, R, scale, cx, cy)
         x1, y1 = world_to_screen(R, -R, scale, cx, cy)
         canvas.create_oval(x0, y0, x1, y1, outline="black", width=2)
+    elif cfg.board_shape == "ellipse":
+        rx, ry = board_ellipse_radii(cfg)
+        x0, y0 = world_to_screen(-rx, ry, scale, cx, cy)
+        x1, y1 = world_to_screen(rx, -ry, scale, cx, cy)
+        canvas.create_oval(x0, y0, x1, y1, outline="black", width=2)
     elif cfg.board_shape == "polar":
         # Sample the polar curve and draw as a closed polyline
         n = 360
@@ -1232,6 +1412,116 @@ def plot_trial(result: TrialResult, cfg: Config):
     root.mainloop()
 
 
+# Distinct colours for overlaid paths (no repeats until 8 trajectories).
+MULTI_START_COLORS = [
+    "#1f77b4", "#d62728", "#2ca02c", "#ff7f0e",
+    "#9467bd", "#8c564b", "#e377c2", "#17becf",
+]
+
+
+def run_multi_start_trial(cfg: Config, points=None, n_points: int = 5,
+                          start_trial_id: int = 1, verbose: bool = True):
+    """
+    Run one trial from each of several start positions, keeping the start ANGLE
+    fixed so position is the only thing that changes.
+
+    `points` overrides the automatic spread (see spread_start_points).
+    Returns the list of TrialResult, one per usable start position.
+    """
+    if points is None:
+        points = spread_start_points(cfg, n_points)
+    if not points:
+        raise ValueError(
+            "Could not place any start position inside this board. "
+            "Check the board size and the obstacle."
+        )
+
+    results = []
+    trial_id = start_trial_id
+    for (sx, sy) in points:
+        probe = copy.deepcopy(cfg)
+        probe.start_x = sx
+        probe.start_y = sy
+        try:
+            res = run_trial(probe, trial_id=trial_id)
+        except ValueError as err:
+            if verbose:
+                print("  skipped start ({:+.3f}, {:+.3f}): {}".format(sx, sy, err))
+            continue
+        results.append(res)
+        if verbose:
+            print("  start ({:+.3f}, {:+.3f}) -> {} bounces, distance {:.2f}".format(
+                sx, sy, res.total_bounces, res.total_distance))
+        trial_id += 1
+    if not results:
+        raise ValueError("Every start position failed to run.")
+    return results
+
+
+def plot_multi_start(results, cfg: Config):
+    """
+    Draw several trajectories on one board so different regions can be compared
+    side by side. Static (no animation) - the point is the comparison.
+    """
+    if not cfg.show_plot or not results:
+        return
+
+    W, H = 760, 760
+    margin = 40
+    legend_h = 18 * (len(results) + 1) + 12
+
+    hw, hh = board_world_half_size(cfg)
+    world_w = 2 * hw if hw > 1e-9 else 2.0
+    world_h = 2 * hh if hh > 1e-9 else 2.0
+
+    board_h = H - legend_h
+    scale = min((W - 2 * margin) / world_w, (board_h - 2 * margin) / world_h)
+    cx, cy = W / 2, legend_h + board_h / 2
+
+    root = tk.Tk()
+    root.title(
+        "Sinai billiard - {} start positions | board={} obstacle={} angle={:.1f} deg"
+        .format(len(results), cfg.board_shape, cfg.obstacle_shape,
+                cfg.start_angle_deg)
+    )
+    canvas = tk.Canvas(root, width=W, height=H, bg="white")
+    canvas.pack()
+
+    _draw_board_and_obstacle(canvas, cfg, scale, cx, cy)
+
+    canvas.create_text(
+        10, 10, anchor="nw", fill="black",
+        text="Same start angle ({:.1f} deg), different start positions. "
+             "Dots mark the starts.".format(cfg.start_angle_deg),
+    )
+
+    for i, res in enumerate(results):
+        colour = MULTI_START_COLORS[i % len(MULTI_START_COLORS)]
+        pts = []
+        for px, py in zip(res.path_x, res.path_y):
+            sx, sy = world_to_screen(px, py, scale, cx, cy)
+            pts.extend([sx, sy])
+        if len(pts) >= 4:
+            canvas.create_line(*pts, fill=colour, width=1)
+
+        sx, sy = world_to_screen(res.path_x[0], res.path_y[0], scale, cx, cy)
+        canvas.create_oval(sx - 5, sy - 5, sx + 5, sy + 5,
+                           fill=colour, outline="black")
+
+        canvas.create_text(
+            10, 28 + 18 * i, anchor="nw", fill=colour,
+            text="start ({:+.3f}, {:+.3f})   {} bounces   distance {:.2f}".format(
+                res.cfg_snapshot["start_x"], res.cfg_snapshot["start_y"],
+                res.total_bounces, res.total_distance),
+        )
+
+    controls = tk.Frame(root)
+    controls.pack(pady=6)
+    tk.Button(controls, text="Close window", command=root.destroy).pack()
+    root.protocol("WM_DELETE_WINDOW", root.destroy)
+    root.mainloop()
+
+
 # =============================================================================
 # SIMPLE TERMINAL QUESTIONS (for beginners)
 # =============================================================================
@@ -1290,21 +1580,25 @@ def interactive_edit_config(cfg: Config) -> Config:
     """Type new values in the terminal. Enter = keep current value."""
     print("\n--- Edit settings (press Enter to keep current) ---")
     cfg.board_shape = ask_str(
-        "Board shape (rectangle/circle/polar)", cfg.board_shape,
-        allowed=["rectangle", "circle", "polar"],
+        "Board shape (rectangle/circle/ellipse/polar)", cfg.board_shape,
+        allowed=["rectangle", "circle", "ellipse", "polar"],
     )
-    # Side ratio only matters for a rectangular board
+    # Side ratio only matters for a rectangular / elliptical board
     if cfg.board_shape == "rectangle":
         cfg.board_ratio = ask_float("Board side ratio width/height", cfg.board_ratio)
         cfg.board_size = ask_float("Board size (half-height)", cfg.board_size)
     elif cfg.board_shape == "circle":
         cfg.board_size = ask_float("Board radius", cfg.board_size)
+    elif cfg.board_shape == "ellipse":
+        cfg.board_ratio = ask_float("Board radius ratio rx/ry", cfg.board_ratio)
+        cfg.board_size = ask_float("Board vertical radius ry", cfg.board_size)
     else:
         # Polar: r(θ) = r0 + a1 cosθ + b1 sinθ + a2 cos2θ + ...
         print("  Polar board: r(θ) = r0 + a1*cosθ + b1*sinθ")
         print("                         + a2*cos2θ + b2*sin2θ")
         print("                         + a3*cos3θ + b3*sin3θ")
-        print("  Keep r(θ) > 0 everywhere (e.g. |a|+|b| < r0).")
+        print("  Keep r(θ) >= 0 everywhere (e.g. |a|+|b| <= r0).")
+        print("  Tip: r0=1, a1=1 is the CARDIOID - a board proven fully chaotic.")
         cfg.polar_r0 = ask_float("polar r0 (base radius)", cfg.polar_r0)
         cfg.polar_a1 = ask_float("polar a1 (cos θ)", cfg.polar_a1)
         cfg.polar_b1 = ask_float("polar b1 (sin θ)", cfg.polar_b1)
@@ -1388,7 +1682,18 @@ def run_many_angle_scan(cfg: Config, angles, start_trial_id=1):
 #
 # Practical defaults used below (standard in the papers above):
 #   - n_bounces   = 500   (after this, regular SALI ~ 4e-6; chaotic << 1e-8)
-#   - threshold   = 1e-8  (orbit called chaotic if SALI <= threshold)
+#   - threshold   = 1e-8  (orbit called chaotic if SALI stays <= threshold)
+#
+# Why "stays" matters (persistence):
+#   A REGULAR orbit that passes close to an unstable periodic orbit (e.g. the
+#   major-axis orbit of an ellipse, or any separatrix) gets its two deviation
+#   vectors transiently squeezed together while it lingers near that unstable
+#   point. SALI then DIPS below the threshold for a few bounces and RECOVERS.
+#   A genuinely chaotic orbit instead collapses to machine zero and never
+#   recovers. So a single dip is not proof of chaos: we require SALI to stay
+#   below the threshold for SALI_DEFAULT_PERSIST consecutive bounces.
+#   Without this, an empty ellipse (an integrable board!) scores ~5% chaotic
+#   purely from those transient dips.
 #   - n_trials    = 360   (angles every 1 deg on [0, 360); ~+/-2.5% SE on the
 #                          chaotic fraction — better than 200, enough for a
 #                          board summary without a full phase-space grid)
@@ -1401,6 +1706,36 @@ SALI_DEFAULT_TRIALS = 360
 SALI_DEFAULT_BOUNCES = 500
 SALI_DEFAULT_THRESHOLD = 1e-8
 SALI_JACOBIAN_EPS = 1e-8
+
+# How many CONSECUTIVE bounces SALI must stay <= threshold before we accept
+# that the orbit is chaotic (see the persistence note above).
+SALI_DEFAULT_PERSIST = 20
+
+# Fraction of one angle step by which the full-circle grid is shifted.
+#
+# Why shift at all: a grid starting exactly at 0 deg samples 0, 90, 180 and
+# 270 deg, which are precisely the symmetry directions where special orbits
+# live (bouncing-ball orbits in the channel beside a centred scatterer, the
+# major-axis orbit of an ellipse, ...). Those families have measure zero, so a
+# correct survey should almost never land on them, but an aligned grid hits all
+# four every time. That alone made the proven-ergodic Sinai billiard score
+# 0.978 instead of 1.000. Shifting the grid off the axes fixes it.
+# Set to 0.0 to get the old exactly-aligned grid back.
+SALI_DEFAULT_ANGLE_OFFSET_FRAC = 0.37
+
+# A board survey needs BOTH numbers, so they are measured together:
+#   chaoticness = mean chaotic fraction over start points
+#   spread      = HALF of (max - min) over those start points
+# One start point only samples a 1D slice of the 2D phase space, so its score
+# alone cannot tell "this board is 65% chaotic everywhere" apart from "this
+# board is 40% chaotic here and 98% chaotic over there". The spread is what
+# distinguishes them, and on measured boards it reached 0.29.
+#
+# Why HALF the width: it is then a plus/minus, so the range the board actually
+# covers is just chaoticness +/- spread instead of needing a division first.
+# Total orbits per survey = SALI_DEFAULT_STARTS * SALI_DEFAULT_ANGLES.
+SALI_DEFAULT_STARTS = 8
+SALI_DEFAULT_ANGLES = 90
 
 
 @dataclass
@@ -1423,6 +1758,7 @@ class ChaoticnessResult:
     regular_fraction: float
     n_bounces: int
     threshold: float
+    persist: int              # consecutive low-SALI bounces required
     start_x: float
     start_y: float
     orbits: list              # list of SaliOrbitResult
@@ -1563,6 +1899,7 @@ def compute_sali_for_angle(
     angle_deg,
     n_bounces=SALI_DEFAULT_BOUNCES,
     threshold=SALI_DEFAULT_THRESHOLD,
+    persist=SALI_DEFAULT_PERSIST,
 ):
     """
     Classify one start angle with SALI on the billiard bounce map.
@@ -1570,7 +1907,9 @@ def compute_sali_for_angle(
     1) Fly from the interior start point to the first bounce (Poincare section).
     2) Evolve two orthonormal deviation vectors with the 2x2 section Jacobian
        for up to n_bounces collisions (Skokos algorithm).
-    3) Label chaotic if SALI <= threshold, else regular/periodic.
+    3) Label chaotic only if SALI STAYS <= threshold for `persist` consecutive
+       bounces (a transient dip near an unstable orbit is not chaos - see the
+       persistence note in the section header), else regular/periodic.
 
     Returns a SaliOrbitResult.
     """
@@ -1596,6 +1935,9 @@ def compute_sali_for_angle(
     w2 = [0.0, 1.0]
     sali = _sali_of(w1, w2)
     done = 0
+    # Length of the current unbroken streak of SALI <= threshold
+    low_streak = 0
+    persist = max(1, int(persist))
 
     for _ in range(int(n_bounces)):
         mapped = _finite_diff_jacobian_2d(x, y, theta, nx, ny, cfg)
@@ -1621,12 +1963,18 @@ def compute_sali_for_angle(
 
         sali = _sali_of(w1, w2)
         if sali <= threshold:
-            return SaliOrbitResult(
-                angle_deg=float(angle_deg),
-                final_sali=sali,
-                n_bounces_done=done,
-                label="chaotic",
-            )
+            low_streak += 1
+            # Sustained collapse: chaotic orbits never climb back out
+            if low_streak >= persist:
+                return SaliOrbitResult(
+                    angle_deg=float(angle_deg),
+                    final_sali=sali,
+                    n_bounces_done=done,
+                    label="chaotic",
+                )
+        else:
+            # SALI recovered, so that dip was only a transient squeeze
+            low_streak = 0
 
     return SaliOrbitResult(
         angle_deg=float(angle_deg),
@@ -1641,8 +1989,10 @@ def measure_board_chaoticness(
     n_trials=SALI_DEFAULT_TRIALS,
     n_bounces=SALI_DEFAULT_BOUNCES,
     threshold=SALI_DEFAULT_THRESHOLD,
+    persist=SALI_DEFAULT_PERSIST,
     angle_start_deg=0.0,
     angle_end_deg=360.0,
+    angle_offset_frac=SALI_DEFAULT_ANGLE_OFFSET_FRAC,
     verbose=True,
 ):
     """
@@ -1655,7 +2005,13 @@ def measure_board_chaoticness(
 
     (failed orbits are reported but excluded from the fraction).
 
-    Defaults (see module comments): n_trials=360, n_bounces=500, threshold=1e-8.
+    NOTE: this is chaoticness AT ONE START POINT, and is only the inner loop of
+    the board survey. Call measure_board_chaos() instead for the board-level
+    chaoticness and spread, because on a mixed board the answer depends
+    strongly on where the ball starts.
+
+    Defaults (see module comments): n_trials=360, n_bounces=500, threshold=1e-8,
+    persist=20, angle_offset_frac=0.37.
     """
     n_trials = max(1, int(n_trials))
     # Use half-open angle grid so 0 and 360 are not duplicated when scanning a full turn
@@ -1665,7 +2021,12 @@ def measure_board_chaoticness(
         span = float(angle_end_deg) - float(angle_start_deg)
         # For a full 360 deg sweep, sample n points in [start, start+360)
         if abs(span - 360.0) < 1e-9:
-            angles = [angle_start_deg + span * i / n_trials for i in range(n_trials)]
+            step = span / n_trials
+            # Nudge the periodic grid off the symmetry axes (see
+            # SALI_DEFAULT_ANGLE_OFFSET_FRAC). Harmless here because the grid
+            # wraps; an explicit sub-range below is left exactly as asked for.
+            shift = step * float(angle_offset_frac)
+            angles = [angle_start_deg + shift + step * i for i in range(n_trials)]
         else:
             angles = linspace(angle_start_deg, angle_end_deg, n_trials)
 
@@ -1676,9 +2037,8 @@ def measure_board_chaoticness(
 
     if verbose:
         print(
-            "SALI chaoticness: {} angles, {} bounces/orbit, threshold={:g}".format(
-                n_trials, n_bounces, threshold
-            )
+            "SALI chaoticness: {} angles, {} bounces/orbit, threshold={:g}, "
+            "persist={}".format(n_trials, n_bounces, threshold, persist)
         )
         print(
             "  start=({:.4g}, {:.4g}), board={}, obstacle={}".format(
@@ -1688,7 +2048,7 @@ def measure_board_chaoticness(
 
     for i, ang in enumerate(angles):
         orbit = compute_sali_for_angle(
-            cfg, ang, n_bounces=n_bounces, threshold=threshold
+            cfg, ang, n_bounces=n_bounces, threshold=threshold, persist=persist
         )
         orbits.append(orbit)
         if orbit.label == "chaotic":
@@ -1718,10 +2078,205 @@ def measure_board_chaoticness(
         regular_fraction=regular_fraction,
         n_bounces=int(n_bounces),
         threshold=float(threshold),
+        persist=max(1, int(persist)),
         start_x=float(cfg.start_x),
         start_y=float(cfg.start_y),
         orbits=orbits,
     )
+
+
+@dataclass
+class StartScore:
+    """Chaoticness measured at one start point."""
+    x: float
+    y: float
+    chaotic_fraction: float
+    n_chaotic: int
+    n_regular: int
+    n_failed: int
+
+
+@dataclass
+class BoardChaosResult:
+    """
+    One board survey holding BOTH headline numbers:
+      chaoticness (mean_fraction) and spread.
+    """
+    board_shape: str
+    obstacle_shape: str
+    n_starts: int
+    n_angles: int             # angles per start point
+    n_bounces: int
+    threshold: float
+    persist: int
+    mean_fraction: float      # the board chaoticness score
+    min_fraction: float
+    max_fraction: float
+    spread: float             # (max - min)/2, a plus/minus; large => mixed
+    total_chaotic: int
+    total_regular: int
+    total_failed: int
+    per_start: list           # list of StartScore
+
+    @property
+    def is_mixed(self) -> bool:
+        """True when regular and chaotic regions coexist on this board."""
+        return self.spread >= 0.025   # half-width, so half of the old 0.05
+
+
+def sample_interior_points(cfg: Config, n_points, seed=12345):
+    """
+    Pick n_points legal ball positions spread uniformly BY AREA over the board.
+
+    Uniform-by-area matters: the chaotic fraction is meant to approximate a
+    phase-space measure, so start points must not be bunched up anywhere.
+    Rejection sampling in the bounding box gives exactly that.
+    """
+    hw, hh = board_world_half_size(cfg)
+    # Small deterministic generator so runs are repeatable without importing random
+    state = int(seed) & 0xFFFFFFFF
+
+    def next_uniform():
+        nonlocal state
+        state = (1103515245 * state + 12345) & 0x7FFFFFFF
+        return state / float(0x7FFFFFFF)
+
+    points = []
+    attempts = 0
+    max_attempts = 20000 * max(1, int(n_points))
+    while len(points) < int(n_points) and attempts < max_attempts:
+        attempts += 1
+        x = (2.0 * next_uniform() - 1.0) * hw
+        y = (2.0 * next_uniform() - 1.0) * hh
+        if not point_inside_board(x, y, cfg):
+            continue
+        if point_inside_obstacle(x, y, cfg):
+            continue
+        points.append((x, y))
+    return points
+
+
+def measure_board_chaos(
+    cfg: Config,
+    n_starts=SALI_DEFAULT_STARTS,
+    n_angles=SALI_DEFAULT_ANGLES,
+    n_bounces=SALI_DEFAULT_BOUNCES,
+    threshold=SALI_DEFAULT_THRESHOLD,
+    persist=SALI_DEFAULT_PERSIST,
+    seed=12345,
+    verbose=True,
+):
+    """
+    Survey a board and return CHAOTICNESS and SPREAD together.
+
+    Sweeps n_angles start directions from each of n_starts start points drawn
+    uniformly by area, then reports:
+
+      chaoticness = mean chaotic fraction over the start points
+      spread      = HALF of (max - min) over the start points, i.e. a +/-
+
+    Both are needed. Chaoticness alone cannot distinguish a board that is
+    uniformly 65% chaotic from one that is 40% chaotic in one region and 98% in
+    another; the spread separates those cases. A spread near 0 means the board
+    behaves the same everywhere (integrable, or fully chaotic); a large spread
+    means regular and chaotic regions coexist and no single number describes it.
+
+    Setting n_starts=1 reduces this to a single-point measurement, in which
+    case spread is 0 by construction and carries no information.
+    """
+    points = sample_interior_points(cfg, n_starts, seed=seed)
+    if not points:
+        raise ValueError(
+            "Could not find any legal start point inside this board. "
+            "Check the board size and the obstacle."
+        )
+
+    if verbose:
+        print("Board chaos survey: {} start points x {} angles x {} bounces "
+              "({} orbits)".format(len(points), n_angles, n_bounces,
+                                   len(points) * int(n_angles)))
+
+    per_start = []
+    scratch = copy.deepcopy(cfg)
+    for i, (sx, sy) in enumerate(points):
+        scratch.start_x = sx
+        scratch.start_y = sy
+        r = measure_board_chaoticness(
+            scratch, n_trials=n_angles, n_bounces=n_bounces,
+            threshold=threshold, persist=persist, verbose=False,
+        )
+        per_start.append(StartScore(
+            x=sx, y=sy, chaotic_fraction=r.chaotic_fraction,
+            n_chaotic=r.n_chaotic, n_regular=r.n_regular, n_failed=r.n_failed,
+        ))
+        if verbose:
+            print("  start {:>2}/{}: ({:+.3f}, {:+.3f}) -> {:.3f}".format(
+                i + 1, len(points), sx, sy, r.chaotic_fraction))
+
+    fracs = [s.chaotic_fraction for s in per_start]
+    return BoardChaosResult(
+        board_shape=str(cfg.board_shape),
+        obstacle_shape=str(cfg.obstacle_shape),
+        n_starts=len(points),
+        n_angles=int(n_angles),
+        n_bounces=int(n_bounces),
+        threshold=float(threshold),
+        persist=max(1, int(persist)),
+        mean_fraction=sum(fracs) / len(fracs),
+        min_fraction=min(fracs),
+        max_fraction=max(fracs),
+        spread=0.5 * (max(fracs) - min(fracs)),
+        total_chaotic=sum(s.n_chaotic for s in per_start),
+        total_regular=sum(s.n_regular for s in per_start),
+        total_failed=sum(s.n_failed for s in per_start),
+        per_start=per_start,
+    )
+
+
+def print_board_chaos_report(result: BoardChaosResult):
+    """
+    Print the single board survey: chaoticness AND spread, plus the per-start
+    detail they come from. TAB-separated so it pastes into Google Sheets.
+    """
+    print("\n--- SALI board chaos survey ---")
+    print("board_shape\t{}".format(result.board_shape))
+    print("obstacle_shape\t{}".format(result.obstacle_shape))
+    print("n_starts\t{}".format(result.n_starts))
+    print("n_angles_per_start\t{}".format(result.n_angles))
+    print("n_bounces\t{}".format(result.n_bounces))
+    print("threshold\t{:g}".format(result.threshold))
+    print("persist\t{}".format(result.persist))
+    print("orbits_total\t{}".format(result.n_starts * result.n_angles))
+    print("orbits_chaotic\t{}".format(result.total_chaotic))
+    print("orbits_regular\t{}".format(result.total_regular))
+    print("orbits_failed\t{}".format(result.total_failed))
+
+    # The two headline numbers
+    print("CHAOTICNESS\t{:.6f}\t({:.2f}%)".format(
+        result.mean_fraction, 100.0 * result.mean_fraction))
+    print("SPREAD_PLUSMINUS\t{:.6f}\t(half of max-min)".format(result.spread))
+    print("min_over_starts\t{:.6f}".format(result.min_fraction))
+    print("max_over_starts\t{:.6f}".format(result.max_fraction))
+
+    if result.n_starts < 2:
+        print("reading\tsingle start point - spread carries no information")
+    elif not result.is_mixed:
+        if result.mean_fraction <= 0.02:
+            kind = "regular everywhere (looks integrable)"
+        elif result.mean_fraction >= 0.98:
+            kind = "chaotic everywhere (looks ergodic)"
+        else:
+            kind = "the same everywhere"
+        print("reading\tUNIFORM phase space: {}".format(kind))
+    else:
+        print("reading\tMIXED phase space: regular and chaotic regions coexist,"
+              " so the chaoticness alone is misleading here")
+
+    print("\nper start point:")
+    print("start_x\tstart_y\tchaotic_fraction\tchaotic\tregular\tfailed")
+    for s in result.per_start:
+        print("{:.6f}\t{:.6f}\t{:.6f}\t{}\t{}\t{}".format(
+            s.x, s.y, s.chaotic_fraction, s.n_chaotic, s.n_regular, s.n_failed))
 
 
 def print_chaoticness_report(result: ChaoticnessResult):
@@ -1732,6 +2287,7 @@ def print_chaoticness_report(result: ChaoticnessResult):
     print("n_trials\t{}".format(result.n_trials))
     print("n_bounces\t{}".format(result.n_bounces))
     print("threshold\t{:g}".format(result.threshold))
+    print("persist\t{}".format(result.persist))
     print("n_chaotic\t{}".format(result.n_chaotic))
     print("n_regular\t{}".format(result.n_regular))
     print("n_failed\t{}".format(result.n_failed))
@@ -1764,12 +2320,13 @@ def main():
     print("  3  = run an ANGLE SCAN (many angles, chaos demo)")
     print("  4  = re-save all trials to CSV (overwrites, for Google Sheets)")
     print("  5  = print current settings")
-    print("  6  = measure board CHAOTICNESS (SALI over many angles)")
+    print("  6  = measure board CHAOTICNESS + SPREAD (SALI survey)")
+    print("  7  = compare START POSITIONS (several paths on one picture)")
     print("  q  = quit")
     print("=" * 60)
 
     while True:
-        choice = input("\nChoose command [1/2/3/4/5/6/q]: ").strip().lower()
+        choice = input("\nChoose command [1/2/3/4/5/6/7/q]: ").strip().lower()
 
         if choice == "q":
             print("Bye!")
@@ -1820,20 +2377,40 @@ def main():
                 print("  {}: {}".format(name, value))
 
         elif choice == "6":
-            print("SALI chaoticness survey (literature defaults shown in []).")
-            n = ask_int("How many angles (trials)", SALI_DEFAULT_TRIALS)
+            print("SALI board chaos survey. Reports BOTH numbers:")
+            print("  CHAOTICNESS = how chaotic the board is on average")
+            print("  SPREAD      = how much that varies across the board,")
+            print("                given as a +/- (near 0 = same everywhere)")
+            ns = ask_int("How many start points", SALI_DEFAULT_STARTS)
+            n = ask_int("Angles per start point", SALI_DEFAULT_ANGLES)
             nb = ask_int("Bounces per orbit (SALI iterations)", SALI_DEFAULT_BOUNCES)
             try:
-                chaos = measure_board_chaoticness(
-                    cfg, n_trials=n, n_bounces=nb, verbose=True
+                chaos = measure_board_chaos(
+                    cfg, n_starts=ns, n_angles=n, n_bounces=nb, verbose=True
                 )
             except ValueError as err:
                 print("ERROR:", err)
                 continue
-            print_chaoticness_report(chaos)
+            print_board_chaos_report(chaos)
+
+        elif choice == "7":
+            print("Compare START POSITIONS: same angle, several places on the board.")
+            npos = ask_int("How many start positions", 5)
+            try:
+                multi_results = run_multi_start_trial(
+                    cfg, n_points=npos, start_trial_id=next_trial_id, verbose=True
+                )
+            except ValueError as err:
+                print("ERROR:", err)
+                continue
+            all_results.extend(multi_results)
+            next_trial_id += len(multi_results)
+            if cfg.save_csv_file:
+                save_results_to_csv(all_results, cfg.save_csv_file)
+            plot_multi_start(multi_results, cfg)
 
         else:
-            print("Unknown command. Use 1, 2, 3, 4, 5, 6, or q.")
+            print("Unknown command. Use 1, 2, 3, 4, 5, 6, 7, 8, or q.")
 
 
 # Run the menu only when you execute this file directly:
