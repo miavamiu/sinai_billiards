@@ -338,6 +338,12 @@ def run_study(spec, n_s=14, n_p=11, n_bounces=300, verbose=True):
 # WRITING THE SPREADSHEET
 # =============================================================================
 
+def _slug(text):
+    """Turn a typed tab title into a short, file-safe study key."""
+    keep = [c if (c.isalnum() or c in " -_") else " " for c in text]
+    return "_".join("".join(keep).split())[:31] or "sweep"
+
+
 def _sheet_title(study):
     """Worksheet names cannot exceed 31 chars or contain []:*?/\\ ."""
     name = study.key
@@ -619,6 +625,143 @@ STUDIES = [
 ]
 
 STUDY_BY_KEY = {s["key"]: s for s in STUDIES}
+
+
+def sweepable_params(cfg):
+    """
+    Which parameters make sense to sweep on the board cfg currently describes.
+
+    Offering `stadium_curve` on a circle would just produce a column of
+    identical rows, so the list is filtered by shape.
+    """
+    shape = cfg.board_shape
+    if shape == "stadium":
+        names = ["stadium_curve", "stadium_half_length", "board_size"]
+    elif shape == "ellipse":
+        names = ["ellipse_bump", "ellipse_bump_n", "board_ratio", "board_size"]
+    elif shape == "polar":
+        names = ["polar_a1", "polar_b1", "polar_a2", "polar_b2",
+                 "polar_a3", "polar_b3", "polar_r0"]
+    elif shape == "circle":
+        names = ["board_size"]
+    else:  # rectangle
+        names = ["board_ratio", "board_size"]
+    if cfg.obstacle_shape != "none":
+        names.append("obstacle_r")
+    return names
+
+
+def ask_values(prompt):
+    """Read a list of numbers typed as '0, 0.05, 0.1' or as a from:to:step range."""
+    while True:
+        raw = input(prompt + ": ").strip()
+        if not raw:
+            print("  Type at least one number.")
+            continue
+        try:
+            if ":" in raw:
+                parts = [float(p) for p in raw.split(":")]
+                if len(parts) != 3 or parts[2] <= 0:
+                    raise ValueError
+                start, stop, step = parts
+                values, v = [], start
+                # Half a step of slack so the endpoint survives rounding
+                while v <= stop + step * 0.5:
+                    values.append(round(v, 10))
+                    v += step
+            else:
+                values = [float(p) for p in raw.replace(",", " ").split()]
+        except ValueError:
+            print("  Could not read that. Use '0, 0.05, 0.1' or 'from:to:step'.")
+            continue
+        if values:
+            return values
+
+
+def interactive_sweep(cfg, out="chaos_studies.xlsx"):
+    """
+    Sweep one parameter of the board the user has already set up, and append
+    the results to the spreadsheet as a new tab.
+
+    This is the menu-driven twin of `main`: same measurement, same columns,
+    same workbook, but the board comes from the live config instead of one of
+    the STUDIES presets.
+    """
+    print("\n--- EXPORT A SWEEP TO A SPREADSHEET ---")
+    print("Takes the board you have set up, changes ONE number over a range,")
+    print("measures the chaos at each value, and writes a tab you can open")
+    print("in Google Sheets.")
+
+    names = sweepable_params(cfg)
+    print("\nParameters you can sweep on this {} board:".format(cfg.board_shape))
+    for i, name in enumerate(names, start=1):
+        print("  {}  {:<22} {}".format(
+            i, name, PARAM_LABELS.get(name, "")))
+    print("  p  use a preset study instead (ignores the board above)")
+
+    pick = input("\nChoose [1-{}/p]: ".format(len(names))).strip().lower()
+    if pick == "p":
+        for s in STUDIES:
+            print("  {:<22} {}".format(s["key"], s["title"]))
+        key = input("Preset key: ").strip()
+        if key not in STUDY_BY_KEY:
+            print("Unknown preset. Nothing done.")
+            return
+        spec = STUDY_BY_KEY[key]
+    else:
+        try:
+            param = names[int(pick) - 1]
+        except (ValueError, IndexError):
+            print("Not a listed choice. Nothing done.")
+            return
+        current = getattr(cfg, param, None) if param != "obstacle_r" \
+            else cfg.obstacle_rx
+        print("\nSweeping {}. Current value: {}".format(param, current))
+        print("Type the values as a list '0, 0.05, 0.1' or a range "
+              "'from:to:step'.")
+        values = ask_values("Values")
+        title = input("Tab title (Enter = auto): ").strip()
+        title = title or "{} board: varying {}".format(cfg.board_shape, param)
+        base = copy.deepcopy(cfg)
+        spec = {
+            # The tab is named after the title, not the parameter, so two
+            # sweeps of the same parameter on different boards land on
+            # different pages instead of overwriting each other.
+            "key": _slug(title),
+            "title": title,
+            "board_note": sb.describe_board(base),
+            "make_cfg": lambda: copy.deepcopy(base),
+            "param": param,
+            "values": values,
+        }
+
+    print("\nHow careful should the measurement be?")
+    print("  1  quick  10 x 7 states, 200 bounces   (first look)")
+    print("  2  normal 14 x 11 states, 300 bounces")
+    print("  3  fine   24 x 15 states, 500 bounces  (final numbers, slow)")
+    level = input("Choose [1/2/3, Enter = 2]: ").strip()
+    n_s, n_p, nb = {"1": (10, 7, 200), "3": (24, 15, 500)}.get(
+        level, (14, 11, 300))
+
+    n_orbits = len(spec["values"]) * n_s * n_p
+    print("\nThat is {} values x {} states = {} orbits.".format(
+        len(spec["values"]), n_s * n_p, n_orbits))
+    if input("Run it? [y/N]: ").strip().lower() not in ("y", "yes"):
+        print("Cancelled.")
+        return
+
+    t0 = time.time()
+    study = run_study(spec, n_s=n_s, n_p=n_p, n_bounces=nb)
+    try:
+        write_xlsx([study], out)
+        print("\nDone in {:.0f} s. Added the tab '{}' to {}".format(
+            time.time() - t0, _sheet_title(study), out))
+        print("Upload that file to Google Drive and open it - each sweep is a tab.")
+    except ImportError:
+        path = study.key + ".tsv"
+        write_tsv(study, path)
+        print("\n(openpyxl missing, so wrote {} instead - paste it into Sheets.)"
+              .format(path))
 
 
 def main(argv):

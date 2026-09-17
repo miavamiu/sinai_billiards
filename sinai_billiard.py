@@ -2143,9 +2143,64 @@ def ask_str(prompt, default, allowed=None):
     return text
 
 
-def interactive_edit_config(cfg: Config) -> Config:
-    """Type new values in the terminal. Enter = keep current value."""
-    print("\n--- Edit settings (press Enter to keep current) ---")
+def describe_board(cfg: Config) -> str:
+    """
+    One line naming the board and the numbers that define it.
+
+    Used as the "board:" note on a spreadsheet page and by the settings
+    command, so a saved sweep always records which table produced it.
+    """
+    if cfg.board_shape == "rectangle":
+        text = "rectangle, half-height {:g}, ratio w/h {:g}".format(
+            cfg.board_size, cfg.board_ratio)
+    elif cfg.board_shape == "circle":
+        text = "circle, radius {:g} (integrable)".format(cfg.board_size)
+    elif cfg.board_shape == "ellipse":
+        text = "ellipse, ry {:g}, rx/ry {:g}".format(
+            cfg.board_size, cfg.board_ratio)
+        if abs(cfg.ellipse_bump) > 0.0:
+            text += ", dented by {:g}*cos({}theta)".format(
+                cfg.ellipse_bump, cfg.ellipse_bump_n)
+        else:
+            text += " (undented, integrable)"
+    elif cfg.board_shape == "stadium":
+        text = ("stadium, half-height r {:g}, straight half-length a {:g}, "
+                "curving c {:g}, gamma a/r {:.4f}".format(
+                    cfg.board_size, cfg.stadium_half_length,
+                    cfg.stadium_curve, stadium_gamma(cfg)))
+    else:
+        terms = []
+        for name, value in (("r0", cfg.polar_r0), ("a1", cfg.polar_a1),
+                            ("b1", cfg.polar_b1), ("a2", cfg.polar_a2),
+                            ("b2", cfg.polar_b2), ("a3", cfg.polar_a3),
+                            ("b3", cfg.polar_b3)):
+            if value != 0.0:
+                terms.append("{}={:g}".format(name, value))
+        text = "polar r(theta) with " + (", ".join(terms) or "all terms zero")
+
+    if cfg.obstacle_shape == "none":
+        return text + "; no obstacle"
+    return text + "; {} obstacle rx {:g} ry {:g} at ({:g}, {:g})".format(
+        cfg.obstacle_shape, cfg.obstacle_rx, cfg.obstacle_ry,
+        cfg.obstacle_x, cfg.obstacle_y)
+
+
+def choose_board(cfg: Config) -> Config:
+    """
+    Pick the board shape and every number that shape needs, in one place.
+
+    All five shapes and all of their knobs live here - including the stadium's
+    level of curving and the ellipse's dent - so there is exactly one function
+    to call (and one function to change) when setting up a table. The wall and
+    the obstacle are both part of "the board", so the obstacle is asked here
+    too; the ball is a separate question, see choose_ball.
+    """
+    print("\n--- BOARD (press Enter to keep the current value) ---")
+    print("  rectangle  flat walls, integrable, no chaos")
+    print("  circle     integrable, no chaos")
+    print("  ellipse    integrable, and can be DENTED to break that")
+    print("  polar      r(theta) as a Fourier series; a1=1 is the cardioid")
+    print("  stadium    rectangle with curved ends; curving dial 0 -> 1")
     cfg.board_shape = ask_str(
         "Board shape (rectangle/circle/ellipse/polar/stadium)", cfg.board_shape,
         allowed=["rectangle", "circle", "ellipse", "polar", "stadium"],
@@ -2224,12 +2279,32 @@ def interactive_edit_config(cfg: Config) -> Config:
     else:
         print("  No obstacle (empty table).")
 
+    # Warn now rather than failing later on the first run
+    try:
+        validate_start(cfg)
+    except ValueError as err:
+        print("  NOTE: {}".format(err))
+        print("  The ball is no longer in a legal spot on this board.")
+        print("  Fix it with the BALL settings, or run the chaos commands,")
+        print("  which place their own start states along the wall.")
+    return cfg
+
+
+def choose_ball(cfg: Config) -> Config:
+    """Where the ball starts, which way it points, and how long it runs."""
+    print("\n--- BALL (press Enter to keep the current value) ---")
     cfg.start_x = ask_float("Ball start x", cfg.start_x)
     cfg.start_y = ask_float("Ball start y", cfg.start_y)
     cfg.start_angle_deg = ask_float("Ball start angle (degrees)", cfg.start_angle_deg)
-
     cfg.max_bounces = ask_int("Max bounces", cfg.max_bounces)
     cfg.max_distance = ask_float("Max path distance", cfg.max_distance)
+    return cfg
+
+
+def interactive_edit_config(cfg: Config) -> Config:
+    """Board then ball, in one pass. Kept so older callers still work."""
+    choose_board(cfg)
+    choose_ball(cfg)
     print("--- settings updated ---\n")
     return cfg
 
@@ -3782,18 +3857,21 @@ def main():
     print("=" * 60)
     print("  SINAI BILLIARD - beginner interactive runner")
     print("=" * 60)
-    print("Commands:")
-    print("  1  = edit settings (board, obstacle, ball, length)")
-    print("  2  = run ONE trial (animated window + tables + auto-save CSV)")
-    print("  3  = run an ANGLE SCAN (many angles, chaos demo)")
-    print("  4  = re-save all trials to CSV (overwrites, for Google Sheets)")
-    print("  5  = print current settings")
-    print("  6  = measure board CHAOTICNESS + SPREAD (SALI survey)")
-    print("  7  = compare START POSITIONS (several paths on one picture)")
-    print("  8  = measure LYAPUNOV number (how FAST nearby paths stretch)")
-    print("  9  = CHAOS PROFILE: both parameters at once (SALI + Lyapunov)")
-    print("  10 = PHASE-SPACE PROFILE: same two numbers sampled over the WHOLE")
-    print("       phase space, plus a map of the regular islands (use for MIXED)")
+    print("SET UP")
+    print("  1  = BOARD    shape, size, denting, curving, obstacle")
+    print("  2  = BALL     start point, angle, run length")
+    print("  3  = show current settings")
+    print("WATCH ONE PATH")
+    print("  4  = run ONE trial (animated window + tables)")
+    print("  5  = compare START POSITIONS (several paths on one picture)")
+    print("  6  = ANGLE SCAN (many angles side by side)")
+    print("MEASURE CHAOS")
+    print("  7  = QUICK check   angles from one start point, fast")
+    print("  8  = FULL profile  whole phase space + map of regular islands")
+    print("                     (use this one for real numbers)")
+    print("EXPORT")
+    print("  9  = sweep a parameter -> Google Sheets spreadsheet")
+    print("  10 = re-save trials to CSV")
     print("  q  = quit")
     print("=" * 60)
 
@@ -3806,9 +3884,18 @@ def main():
             break
 
         elif choice == "1":
-            cfg = interactive_edit_config(cfg)
+            cfg = choose_board(cfg)
 
         elif choice == "2":
+            cfg = choose_ball(cfg)
+
+        elif choice == "3":
+            print("\nBoard: " + describe_board(cfg))
+            print("\nAll settings:")
+            for name, value in cfg.__dict__.items():
+                print("  {}: {}".format(name, value))
+
+        elif choice == "4":
             try:
                 result = run_trial(cfg, trial_id=next_trial_id)
             except ValueError as err:
@@ -3824,49 +3911,7 @@ def main():
             plot_trial(result, cfg)
             next_trial_id += 1
 
-        elif choice == "3":
-            print("Angle scan: many trials with different start angles.")
-            a0 = ask_float("First angle (degrees)", cfg.start_angle_deg)
-            a1 = ask_float("Last angle (degrees)", cfg.start_angle_deg + 5.0)
-            n = ask_int("How many angles", 6)
-            angles = linspace(a0, a1, n)
-            results = run_many_angle_scan(cfg, angles, start_trial_id=next_trial_id)
-            all_results.extend(results)
-            next_trial_id += len(results)
-            if cfg.save_csv_file:
-                # Save the WHOLE session (overwrites), so no duplicates
-                save_results_to_csv(all_results, cfg.save_csv_file)
-            print("Angle scan done.")
-
-        elif choice == "4":
-            if not all_results:
-                print("No trials yet. Run command 2 or 3 first.")
-            else:
-                save_results_to_csv(all_results, cfg.save_csv_file)
-
         elif choice == "5":
-            print("\nCurrent settings:")
-            for name, value in cfg.__dict__.items():
-                print("  {}: {}".format(name, value))
-
-        elif choice == "6":
-            print("SALI board chaos survey. Reports BOTH numbers:")
-            print("  CHAOTICNESS = how chaotic the board is on average")
-            print("  SPREAD      = how much that varies across the board,")
-            print("                given as a +/- (near 0 = same everywhere)")
-            ns = ask_int("How many start points", SALI_DEFAULT_STARTS)
-            n = ask_int("Angles per start point", SALI_DEFAULT_ANGLES)
-            nb = ask_int("Bounces per orbit (SALI iterations)", SALI_DEFAULT_BOUNCES)
-            try:
-                chaos = measure_board_chaos(
-                    cfg, n_starts=ns, n_angles=n, n_bounces=nb, verbose=True
-                )
-            except ValueError as err:
-                print("ERROR:", err)
-                continue
-            print_board_chaos_report(chaos)
-
-        elif choice == "7":
             print("Compare START POSITIONS: same angle, several places on the board.")
             npos = ask_int("How many start positions", 5)
             try:
@@ -3882,31 +3927,22 @@ def main():
                 save_results_to_csv(all_results, cfg.save_csv_file)
             plot_multi_start(multi_results, cfg)
 
-        elif choice == "8":
-            print("Lyapunov number checker. SALI (command 6) tells HOW MUCH")
-            print("of the board is chaotic; this tells HOW FAST nearby paths")
-            print("stretch. L ~ 1 is regular; bigger L = more violent chaos.")
-            nb = ask_int("Bounces per orbit", LYAPUNOV_DEFAULT_BOUNCES)
-            n_ang = ask_int(
-                "How many start angles (1 = current angle only)", 1
-            )
-            try:
-                if n_ang <= 1:
-                    orbit = compute_lyapunov_for_angle(
-                        cfg, cfg.start_angle_deg, n_bounces=nb
-                    )
-                    print_lyapunov_orbit_report(orbit)
-                else:
-                    survey = measure_lyapunov_at_start(
-                        cfg, n_trials=n_ang, n_bounces=nb, verbose=True
-                    )
-                    print_lyapunov_survey_report(survey)
-            except ValueError as err:
-                print("ERROR:", err)
-                continue
+        elif choice == "6":
+            print("Angle scan: many trials with different start angles.")
+            a0 = ask_float("First angle (degrees)", cfg.start_angle_deg)
+            a1 = ask_float("Last angle (degrees)", cfg.start_angle_deg + 5.0)
+            n = ask_int("How many angles", 6)
+            angles = linspace(a0, a1, n)
+            results = run_many_angle_scan(cfg, angles, start_trial_id=next_trial_id)
+            all_results.extend(results)
+            next_trial_id += len(results)
+            if cfg.save_csv_file:
+                # Save the WHOLE session (overwrites), so no duplicates
+                save_results_to_csv(all_results, cfg.save_csv_file)
+            print("Angle scan done.")
 
-        elif choice == "9":
-            print("CHAOS PROFILE - the full answer in two numbers:")
+        elif choice == "7":
+            print("QUICK CHAOS CHECK - the full answer in two numbers:")
             print("  [1] SALI chaotic fraction = HOW MUCH of the board is chaotic")
             print("  [2] Lyapunov exponent     = HOW HARD that chaos stretches")
             print("Both are measured on the same angle sweep, and the Lyapunov")
@@ -3922,9 +3958,9 @@ def main():
                 continue
             print_chaos_profile(profile)
 
-        elif choice == "10":
-            print("PHASE-SPACE PROFILE - the same two numbers, sampled honestly.")
-            print("Command 9 fires angles from ONE point, which traces a single")
+        elif choice == "8":
+            print("FULL PROFILE - the same two numbers, sampled honestly.")
+            print("Command 7 fires angles from ONE point, which traces a single")
             print("curve through a 2-D phase space. This spreads the start states")
             print("uniformly over the WHOLE phase space (Birkhoff s and p), so the")
             print("chaotic fraction is a real fraction of phase space.")
@@ -3940,6 +3976,18 @@ def main():
                 print("ERROR:", err)
                 continue
             print_phase_space_profile(profile)
+
+        elif choice == "9":
+            # Imported here, not at the top of the file: chaos_studies imports
+            # this module, so a top-level import would be circular.
+            import chaos_studies
+            chaos_studies.interactive_sweep(cfg)
+
+        elif choice == "10":
+            if not all_results:
+                print("No trials yet. Run command 4, 5 or 6 first.")
+            else:
+                save_results_to_csv(all_results, cfg.save_csv_file)
 
         else:
             print("Unknown command. Use 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, or q.")
