@@ -1,7 +1,12 @@
 __pycache__/
 *.py[cod]
+
+# Generated results - rebuild these by re-running the scripts
 *.csv
+*.tsv
+*.xlsx
 sinai_results*
+lyapunov_literature_report.pdf
 .DS_Store
 Thumbs.db
 .gitignore.txt

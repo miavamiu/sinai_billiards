@@ -90,6 +90,33 @@ class Config:
     polar_a3: float = 0.0
     polar_b3: float = 0.0
 
+    # ----- STADIUM BOARD -----
+    # A rectangle whose two SHORT ends are replaced by outward circular arcs:
+    #
+    #        stadium_half_length = a  ->  half-length of the STRAIGHT section
+    #        board_size          = r  ->  half-height (and the cap scale)
+    #        stadium_curve       = c  ->  LEVEL OF CURVING, 0 < c <= 1
+    #
+    # The cap bulges out by d = c * r, so c = 1 makes the caps exact
+    # SEMICIRCLES and the board is the classic Bunimovich stadium.
+    # Smaller c gives shallower caps. See stadium_geometry() for the formulas.
+    #
+    # The literature shape parameter is gamma = a / r. Published maximum
+    # Lyapunov exponent is ~0.43 at gamma = 1 with c = 1.
+    stadium_half_length: float = 1.0
+    stadium_curve: float = 1.0
+
+    # ----- DENTING AN ELLIPSE -----
+    # Only used when board_shape == "ellipse". The wall becomes
+    #
+    #        r(theta) = r_ellipse(theta) * (1 + ellipse_bump * cos(n theta))
+    #
+    # ellipse_bump = 0 leaves the ellipse EXACTLY as it was, so it is a clean
+    # integrable baseline to perturb away from. Keep |ellipse_bump| < 1 or the
+    # radius passes through zero and the wall stops being a simple closed curve.
+    ellipse_bump: float = 0.0
+    ellipse_bump_n: int = 2
+
     # ----- OBSTACLE (prepyatstvie) -----
     # Allowed: "circle", "ellipse", "rectangle", or "none" (no obstacle)
     obstacle_shape: str = "circle"
@@ -152,6 +179,86 @@ def board_ellipse_radii(cfg: Config):
     return board_half_extents(cfg)
 
 
+def dented_ellipse_radius(theta, cfg: Config) -> float:
+    """
+    r(theta) for an ellipse carrying a small smooth radial dent.
+
+        r(theta) = r_ellipse(theta) * (1 + eps * cos(n * theta))
+
+    where r_ellipse is the ellipse measured from its own centre,
+
+        r_ellipse(theta) = 1 / sqrt( (cos/rx)^2 + (sin/ry)^2 ).
+
+    eps = 0 returns the ellipse EXACTLY, which matters: the whole point of the
+    study is that the eps = 0 baseline is a genuinely integrable board. An
+    ellipse is not a finite Fourier series in theta, so it cannot be written
+    as a "polar" board here - hence this separate radius function.
+    """
+    rx, ry = board_ellipse_radii(cfg)
+    if rx <= 0 or ry <= 0:
+        return 0.0
+    c, s = math.cos(theta), math.sin(theta)
+    g = (c / rx) ** 2 + (s / ry) ** 2
+    if g <= 0:
+        return 0.0
+    r_ell = 1.0 / math.sqrt(g)
+    n = float(cfg.ellipse_bump_n)
+    return r_ell * (1.0 + cfg.ellipse_bump * math.cos(n * theta))
+
+
+def dented_ellipse_radius_deriv(theta, cfg: Config) -> float:
+    """
+    dr/dtheta of dented_ellipse_radius, done analytically.
+
+    With g = (cos/rx)^2 + (sin/ry)^2 we have r_ellipse = g^(-1/2), and
+    g' = sin(2 theta) * (1/ry^2 - 1/rx^2), so r_ellipse' = -g' / (2 g^(3/2)).
+    The dent B = 1 + eps cos(n theta) then contributes by the product rule.
+    """
+    rx, ry = board_ellipse_radii(cfg)
+    if rx <= 0 or ry <= 0:
+        return 0.0
+    c, s = math.cos(theta), math.sin(theta)
+    g = (c / rx) ** 2 + (s / ry) ** 2
+    if g <= 0:
+        return 0.0
+    dg = math.sin(2.0 * theta) * (1.0 / (ry * ry) - 1.0 / (rx * rx))
+    r_ell = 1.0 / math.sqrt(g)
+    dr_ell = -0.5 * dg / (g ** 1.5)
+    n = float(cfg.ellipse_bump_n)
+    B = 1.0 + cfg.ellipse_bump * math.cos(n * theta)
+    dB = -cfg.ellipse_bump * n * math.sin(n * theta)
+    return dr_ell * B + r_ell * dB
+
+
+def board_is_radial(cfg: Config) -> bool:
+    """
+    True when the board is solved by the generic r(theta) ray marcher.
+
+    That covers polar boards and a DENTED ellipse. A plain ellipse
+    (ellipse_bump == 0) stays on its exact quadratic solver, which is both
+    faster and free of marching error.
+    """
+    if cfg.board_shape == "polar":
+        return True
+    if cfg.board_shape == "ellipse":
+        return abs(cfg.ellipse_bump) > 0.0
+    return False
+
+
+def radial_radius(theta, cfg: Config) -> float:
+    """r(theta) for whichever radial board this is."""
+    if cfg.board_shape == "ellipse":
+        return dented_ellipse_radius(theta, cfg)
+    return polar_radius(theta, cfg)
+
+
+def radial_radius_deriv(theta, cfg: Config) -> float:
+    """dr/dtheta for whichever radial board this is."""
+    if cfg.board_shape == "ellipse":
+        return dented_ellipse_radius_deriv(theta, cfg)
+    return polar_radius_deriv(theta, cfg)
+
+
 def polar_radius(theta, cfg: Config) -> float:
     """
     r(θ) for a polar board:
@@ -182,8 +289,8 @@ def polar_inward_normal(theta, cfg: Config):
     Tangent:  X'(θ) = (r' cosθ - r sinθ, r' sinθ + r cosθ)
     Inward = (-X'_y, X'_x)  (for a circle this is -radial)
     """
-    r = polar_radius(theta, cfg)
-    dr = polar_radius_deriv(theta, cfg)
+    r = radial_radius(theta, cfg)
+    dr = radial_radius_deriv(theta, cfg)
     c = math.cos(theta)
     s = math.sin(theta)
     nx = -(dr * s + r * c)
@@ -212,7 +319,13 @@ _POLAR_EXTREMA_CACHE = {}
 
 def _polar_extrema(cfg: Config, samples: int):
     """Return (min r, max r) over a dense sample, cached per curve."""
-    key = (polar_coefficients(cfg), samples)
+    if cfg.board_shape == "ellipse":
+        # A dented ellipse is set by its radii plus the dent, not by the
+        # Fourier coefficients, so it needs its own cache key.
+        key = ("ellipse", board_ellipse_radii(cfg),
+               cfg.ellipse_bump, cfg.ellipse_bump_n, samples)
+    else:
+        key = (polar_coefficients(cfg), samples)
     hit = _POLAR_EXTREMA_CACHE.get(key)
     if hit is not None:
         return hit
@@ -220,7 +333,7 @@ def _polar_extrema(cfg: Config, samples: int):
     hi = 0.0
     for i in range(samples):
         theta = 2.0 * math.pi * i / samples
-        r = polar_radius(theta, cfg)
+        r = radial_radius(theta, cfg)
         lo = min(lo, r)
         hi = max(hi, r)
     _POLAR_EXTREMA_CACHE[key] = (lo, hi)
@@ -237,6 +350,317 @@ def min_polar_radius(cfg: Config, samples: int = 720) -> float:
     return _polar_extrema(cfg, samples)[0]
 
 
+def stadium_geometry(cfg: Config):
+    """
+    Geometry of the stadium board ("rectangle with arc-capped ends").
+
+    Layout, with the board centred on (0, 0):
+
+        straight walls : y = +r and y = -r, for |x| <= a
+        end caps       : two circular arcs, each through (a, -r) and (a, +r)
+                         and bulging outward to (a + d, 0)
+
+        r  = board_size              half-height
+        a  = stadium_half_length     half-length of the STRAIGHT section
+        d  = stadium_curve * r       how far the cap bulges past x = a
+
+    The arc has a chord of half-length r and a sagitta (bulge) of d, so its
+    radius follows from the standard sagitta relation R = (chord^2/4 + d^2)/(2d):
+
+        R  = (r^2 + d^2) / (2 d)
+        xc = a + d - R               arc centre, on the x axis
+
+    Two things make this parametrisation convenient:
+
+      - stadium_curve = 1 gives d = r, hence R = r and xc = a. The caps are
+        exact SEMICIRCLES and the board is the classic Bunimovich stadium.
+      - the arc's half-height at x = a is always sqrt(2 R d - d^2) = r, so the
+        cap meets the straight wall exactly at the corners (a, +/- r) for
+        every value of c. Only c = 1 joins them SMOOTHLY; a smaller c leaves a
+        corner there, which is legal (a plain rectangle has four of them).
+
+    Returns (a, r, d, R, xc).
+    """
+    r = float(cfg.board_size)
+    a = float(cfg.stadium_half_length)
+    # Clamp the curving so R stays finite. c -> 0 is a rectangle; use
+    # board_shape = "rectangle" for that instead of an almost-flat arc.
+    c = min(1.0, max(1e-3, float(cfg.stadium_curve)))
+    d = c * r
+    R = (r * r + d * d) / (2.0 * d)
+    xc = a + d - R
+    return a, r, d, R, xc
+
+
+def stadium_gamma(cfg: Config) -> float:
+    """Literature shape parameter gamma = a / r of the stadium board."""
+    r = float(cfg.board_size)
+    if r <= 0:
+        return float("nan")
+    return float(cfg.stadium_half_length) / r
+
+
+def stadium_boundary_points(cfg: Config, n_per_arc: int = 90):
+    """
+    The stadium outline as a closed list of (x, y), for drawing.
+
+    Walks: bottom wall -> right cap -> top wall -> left cap.
+    """
+    a, r, d, R, xc = stadium_geometry(cfg)
+    # Half-angle the cap subtends at its own centre: sin(phi) = r / R
+    phi = math.asin(max(-1.0, min(1.0, r / R)))
+    pts = [(-a, -r), (a, -r)]
+    # Right cap: sweep from -phi up to +phi around the centre (xc, 0)
+    for i in range(n_per_arc + 1):
+        ang = -phi + 2.0 * phi * i / n_per_arc
+        pts.append((xc + R * math.cos(ang), R * math.sin(ang)))
+    pts.append((a, r))
+    pts.append((-a, r))
+    # Left cap: mirror image, swept back down
+    for i in range(n_per_arc + 1):
+        ang = phi - 2.0 * phi * i / n_per_arc
+        pts.append((-xc - R * math.cos(ang), R * math.sin(ang)))
+    pts.append((-a, -r))
+    return pts
+
+
+# =============================================================================
+# BIRKHOFF COORDINATES: the honest way to sample a billiard's phase space
+# =============================================================================
+# A billiard's state at a collision needs exactly two numbers:
+#
+#     s = distance walked along the wall to the collision point   (0 .. L)
+#     p = sin(phi), phi = angle between the outgoing ray and the
+#         INWARD normal at that point                             (-1 .. +1)
+#
+# These are the Birkhoff coordinates, and the reason they matter is that the
+# bounce map preserves the plain area element ds dp. So "pick s and p uniformly
+# at random" samples every part of phase space with its correct weight, and the
+# fraction of chaotic samples is then a genuine fraction of phase space.
+#
+# Contrast with firing many angles from ONE interior point, which is what
+# analyse_chaos does: that traces a 1-D curve through this 2-D rectangle. It
+# says something real about that curve, but its "fraction" is not a phase-space
+# fraction, and it systematically under-samples grazing orbits (|p| near 1)
+# because a fixed interior point can only graze the wall from a narrow range of
+# directions. Grazing orbits are exactly where the regular whispering-gallery
+# region lives on a smooth convex board, so that bias matters most precisely
+# for MIXED boards - the case worth studying.
+
+
+def board_boundary_polyline(cfg: Config, n_per_piece: int = 1200):
+    """
+    The wall as a dense closed list of (x, y), walked counter-clockwise-ish.
+
+    Only used to lay out starting conditions, never to advance the ball: the
+    dynamics keeps using the exact per-shape hit routines. So a fine polyline
+    is accurate enough here even where the true wall is curved.
+    """
+    pts = []
+    if cfg.board_shape == "rectangle":
+        hw, hh = board_half_extents(cfg)
+        corners = [(-hw, -hh), (hw, -hh), (hw, hh), (-hw, hh)]
+        for i in range(4):
+            x0, y0 = corners[i]
+            x1, y1 = corners[(i + 1) % 4]
+            for k in range(n_per_piece):
+                f = k / n_per_piece
+                pts.append((x0 + f * (x1 - x0), y0 + f * (y1 - y0)))
+        return pts
+
+    if cfg.board_shape == "stadium":
+        a, r, _d, R, xc = stadium_geometry(cfg)
+        phi = math.asin(max(-1.0, min(1.0, r / R)))
+        # bottom wall, left to right
+        for k in range(n_per_piece):
+            pts.append((-a + 2.0 * a * k / n_per_piece, -r))
+        # right cap, sweeping up through the bulge
+        for k in range(n_per_piece):
+            ang = -phi + 2.0 * phi * k / n_per_piece
+            pts.append((xc + R * math.cos(ang), R * math.sin(ang)))
+        # top wall, right to left
+        for k in range(n_per_piece):
+            pts.append((a - 2.0 * a * k / n_per_piece, r))
+        # left cap, sweeping back down
+        for k in range(n_per_piece):
+            ang = phi - 2.0 * phi * k / n_per_piece
+            pts.append((-xc - R * math.cos(ang), R * math.sin(ang)))
+        return pts
+
+    n = 4 * n_per_piece
+    for k in range(n):
+        t = 2.0 * math.pi * k / n
+        if cfg.board_shape == "circle":
+            pts.append((cfg.board_size * math.cos(t), cfg.board_size * math.sin(t)))
+        elif cfg.board_shape == "ellipse" and not board_is_radial(cfg):
+            rx, ry = board_ellipse_radii(cfg)
+            pts.append((rx * math.cos(t), ry * math.sin(t)))
+        else:
+            # polar board, or a dented ellipse: both are r(theta)
+            rr = radial_radius(t, cfg)
+            pts.append((rr * math.cos(t), rr * math.sin(t)))
+    return pts
+
+
+_BOUNDARY_TABLE_CACHE = {}
+
+
+def _boundary_config_key(cfg: Config):
+    """Everything that changes the WALL, and nothing else."""
+    return (
+        cfg.board_shape, cfg.board_size, cfg.board_ratio,
+        polar_coefficients(cfg),
+        cfg.stadium_half_length, cfg.stadium_curve,
+        cfg.ellipse_bump, cfg.ellipse_bump_n,
+    )
+
+
+def boundary_table(cfg: Config):
+    """
+    Cached (points, cumulative_arclength, total_length) for the wall.
+
+    cumulative[i] is the distance from points[0] round to points[i], and the
+    final entry closes the loop back to points[0].
+    """
+    key = _boundary_config_key(cfg)
+    hit = _BOUNDARY_TABLE_CACHE.get(key)
+    if hit is not None:
+        return hit
+
+    pts = board_boundary_polyline(cfg)
+    cum = [0.0]
+    for i in range(1, len(pts)):
+        cum.append(cum[-1] + math.hypot(pts[i][0] - pts[i - 1][0],
+                                       pts[i][1] - pts[i - 1][1]))
+    total = cum[-1] + math.hypot(pts[0][0] - pts[-1][0],
+                                 pts[0][1] - pts[-1][1])
+    out = (pts, cum, total)
+    _BOUNDARY_TABLE_CACHE[key] = out
+    return out
+
+
+def boundary_perimeter(cfg: Config) -> float:
+    """Total wall length L, so s can be reported as a fraction of it."""
+    return boundary_table(cfg)[2]
+
+
+def boundary_frame_at(cfg: Config, s: float):
+    """
+    Point on the wall at arclength s, plus the local frame there.
+
+    Returns (x, y, tx, ty, nx, ny): the unit tangent (in the direction of
+    increasing s) and the unit normal pointing INTO the board. The inward
+    direction is decided by testing point_inside_board a hair off the wall,
+    so it stays correct for every shape without per-shape sign conventions.
+    """
+    pts, cum, total = boundary_table(cfg)
+    if total <= 0:
+        return None
+    s = s % total
+
+    # Which polyline segment contains s
+    lo, hi = 0, len(cum) - 1
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if cum[mid] <= s:
+            lo = mid + 1
+        else:
+            hi = mid
+    i = max(0, lo - 1)
+    j = (i + 1) % len(pts)
+
+    seg = (cum[j] - cum[i]) if j > i else (total - cum[i])
+    f = ((s - cum[i]) / seg) if seg > 1e-15 else 0.0
+    x = pts[i][0] + f * (pts[j][0] - pts[i][0])
+    y = pts[i][1] + f * (pts[j][1] - pts[i][1])
+
+    tx, ty = pts[j][0] - pts[i][0], pts[j][1] - pts[i][1]
+    tlen = math.hypot(tx, ty)
+    if tlen < 1e-15:
+        return None
+    tx, ty = tx / tlen, ty / tlen
+
+    # Two normal candidates; keep the one that points into free space
+    nx, ny = -ty, tx
+    probe = 1e-7 * max(1.0, boundary_perimeter(cfg))
+    if not point_inside_board(x + probe * nx, y + probe * ny, cfg):
+        nx, ny = -nx, -ny
+    return x, y, tx, ty, nx, ny
+
+
+def birkhoff_launch(cfg: Config, s: float, p: float):
+    """
+    Turn Birkhoff coordinates (s, p) into a start point and heading.
+
+    The ball is placed a hair inside the wall at arclength s and sent off at
+    angle phi = asin(p) from the inward normal, so p = 0 leaves perpendicular
+    to the wall and |p| near 1 skims along it.
+
+    Returns (x, y, angle_deg), or None when that state is unusable - inside
+    the obstacle, or on a cusp where the wall has no well-defined normal.
+    """
+    frame = boundary_frame_at(cfg, s)
+    if frame is None:
+        return None
+    x, y, tx, ty, nx, ny = frame
+
+    p = max(-0.999999, min(0.999999, p))
+    phi = math.asin(p)
+    dx = math.cos(phi) * nx + math.sin(phi) * tx
+    dy = math.cos(phi) * ny + math.sin(phi) * ty
+
+    # Step off the wall so the ray solvers are not asked to start exactly on it
+    off = 1e-6 * max(1.0, boundary_perimeter(cfg))
+    sx, sy = x + off * nx, y + off * ny
+    if not point_inside_board(sx, sy, cfg):
+        return None
+    if point_inside_obstacle(sx, sy, cfg):
+        return None
+    return sx, sy, math.degrees(math.atan2(dy, dx))
+
+
+# Fraction of a grid step by which the (s, p) grid is shifted, so it never
+# lands on symmetry values. Same value and same reason as
+# SALI_DEFAULT_ANGLE_OFFSET_FRAC further down; kept separate only because that
+# constant is defined later in the file than this function.
+BIRKHOFF_GRID_OFFSET_FRAC = 0.37
+
+
+def sample_birkhoff_grid(cfg: Config, n_s: int = 24, n_p: int = 15,
+                         offset_frac=BIRKHOFF_GRID_OFFSET_FRAC):
+    """
+    A uniform (s, p) grid over the whole phase space.
+
+    Cells are offset by offset_frac of a step rather than sampled at their
+    centres, for the same reason the angle sweep is offset (see
+    SALI_DEFAULT_ANGLE_OFFSET_FRAC): a grid that lands on symmetry values hits
+    special orbit families that have measure zero and so should almost never
+    be sampled.
+
+    Centre-sampling gets this wrong in a very specific way. With an odd n_p the
+    middle row falls on p = 0 EXACTLY, which on a straight wall is the orbit
+    bouncing perpendicularly between two parallel walls forever. In a stadium
+    that is the marginally unstable "bouncing ball" family: genuinely
+    non-chaotic, genuinely measure zero, and enough to score the proven-ergodic
+    stadium at 0.966 instead of 1.000. Offsetting removes it.
+
+    Returns a list of (s, p, x, y, angle_deg).
+    """
+    total = boundary_perimeter(cfg)
+    n_s = max(1, int(n_s))
+    n_p = max(1, int(n_p))
+    out = []
+    for i in range(n_s):
+        s = total * (i + float(offset_frac)) / n_s
+        for j in range(n_p):
+            p = -1.0 + 2.0 * (j + float(offset_frac)) / n_p
+            launch = birkhoff_launch(cfg, s, p)
+            if launch is None:
+                continue
+            out.append((s, p) + launch)
+    return out
+
+
 def board_world_half_size(cfg: Config):
     """Half-width and half-height of a box that contains the whole board."""
     if cfg.board_shape == "rectangle":
@@ -245,10 +669,16 @@ def board_world_half_size(cfg: Config):
         R = cfg.board_size
         return R, R
     if cfg.board_shape == "ellipse":
+        if board_is_radial(cfg):
+            R = max_polar_radius(cfg)
+            return R, R
         return board_ellipse_radii(cfg)
     if cfg.board_shape == "polar":
         R = max_polar_radius(cfg)
         return R, R
+    if cfg.board_shape == "stadium":
+        a, r, d, _R, _xc = stadium_geometry(cfg)
+        return a + d, r
     raise ValueError("Unknown board_shape: " + str(cfg.board_shape))
 
 
@@ -263,6 +693,11 @@ def point_inside_board(x, y, cfg: Config) -> bool:
         rx, ry = board_ellipse_radii(cfg)
         if rx <= 0 or ry <= 0:
             return False
+        if board_is_radial(cfg):
+            rho = math.hypot(x, y)
+            if rho < 1e-15:
+                return min_polar_radius(cfg) > 0.0
+            return rho < dented_ellipse_radius(math.atan2(y, x), cfg)
         return (x / rx) ** 2 + (y / ry) ** 2 < 1.0
     if cfg.board_shape == "polar":
         rho = math.hypot(x, y)
@@ -273,6 +708,15 @@ def point_inside_board(x, y, cfg: Config) -> bool:
             return min_polar_radius(cfg) > 0.0
         theta = math.atan2(y, x)
         return rho < polar_radius(theta, cfg)
+    if cfg.board_shape == "stadium":
+        a, r, _d, R, xc = stadium_geometry(cfg)
+        if abs(x) <= a:
+            # Straight section: only the top/bottom walls limit the ball
+            return abs(y) < r
+        # Beyond the straight section the wall is the capping arc. Its centre
+        # sits at (+xc, 0) on the right and (-xc, 0) on the left.
+        dx = (x - xc) if x > 0 else (x + xc)
+        return dx * dx + y * y < R * R
     raise ValueError("Unknown board_shape: " + str(cfg.board_shape))
 
 
@@ -403,6 +847,43 @@ def validate_start(cfg: Config):
             raise ValueError(
                 "Ellipse board needs positive radii (got rx = {:.4f}, ry = {:.4f}). "
                 "Make board_size and board_ratio positive.".format(rx, ry)
+            )
+        if abs(cfg.ellipse_bump) >= 1.0:
+            raise ValueError(
+                "ellipse_bump must satisfy |bump| < 1, got {:.4f}. At 1 the "
+                "radius reaches 0 and the wall stops being a simple closed "
+                "curve.".format(cfg.ellipse_bump)
+            )
+        if int(cfg.ellipse_bump_n) < 1:
+            raise ValueError(
+                "ellipse_bump_n must be an integer >= 1, got {}. A "
+                "non-integer would leave the wall open at theta = 2 pi."
+                .format(cfg.ellipse_bump_n)
+            )
+    if cfg.board_shape == "stadium":
+        if cfg.board_size <= 0:
+            raise ValueError(
+                "Stadium board needs board_size (half-height) > 0, got {:.4f}."
+                .format(cfg.board_size)
+            )
+        if cfg.stadium_half_length < 0:
+            raise ValueError(
+                "Stadium needs stadium_half_length >= 0, got {:.4f}. "
+                "Use 0 for the degenerate case (two caps back to back)."
+                .format(cfg.stadium_half_length)
+            )
+        if cfg.stadium_curve <= 0:
+            raise ValueError(
+                "Stadium needs stadium_curve > 0, got {:.4f}. "
+                "A completely flat end is just a rectangle - set "
+                'board_shape = "rectangle" instead.'.format(cfg.stadium_curve)
+            )
+        if cfg.stadium_curve > 1.0 + 1e-12:
+            raise ValueError(
+                "Stadium curve must be <= 1, got {:.4f}. At 1 the caps are "
+                "already semicircles (the classic Bunimovich stadium); "
+                "bulging further would make the wall fold back on itself."
+                .format(cfg.stadium_curve)
             )
     if not point_inside_board(cfg.start_x, cfg.start_y, cfg):
         raise ValueError(
@@ -580,9 +1061,9 @@ def _polar_signed_gap(x, y, vx, vy, t, cfg: Config) -> float:
     rho = math.hypot(px, py)
     if rho < 1e-15:
         # At the origin: always inside for a positive polar curve
-        return -polar_radius(0.0, cfg)
+        return -radial_radius(0.0, cfg)
     theta = math.atan2(py, px)
-    return rho - polar_radius(theta, cfg)
+    return rho - radial_radius(theta, cfg)
 
 
 def hit_polar_board(x, y, vx, vy, cfg: Config):
@@ -641,15 +1122,82 @@ def hit_polar_board(x, y, vx, vy, cfg: Config):
     return (t_hit, nx, ny)
 
 
+def hit_stadium_board(x, y, vx, vy, cfg: Config):
+    """
+    Next hit with the stadium wall.
+
+    Four surfaces: two straight walls (only over |x| <= a) and two capping
+    arcs (only beyond |x| = a). Every positive root of every surface is
+    collected and the earliest valid one wins, so a ball skimming from the
+    straight wall onto a cap is handled by the same code path.
+
+    Like hit_rectangle_board, simultaneous hits have their normals added: when
+    stadium_curve < 1 there is a real corner at (+/- a, +/- r).
+    """
+    a, r, _d, R, xc = stadium_geometry(cfg)
+    candidates = []
+
+    # --- straight top / bottom walls, valid only over the straight section ---
+    if abs(vy) > 1e-15:
+        for wall_y, inward_ny in ((r, -1.0), (-r, 1.0)):
+            t = (wall_y - y) / vy
+            if t > 1e-10:
+                xx = x + t * vx
+                if -a - 1e-12 <= xx <= a + 1e-12:
+                    candidates.append((t, 0.0, inward_ny))
+
+    # --- the two capping arcs ---
+    # side = +1 is the right cap (centre at +xc), side = -1 the left one.
+    for side in (1.0, -1.0):
+        arc_cx = side * xc
+        px, py = x - arc_cx, y
+        qa = vx * vx + vy * vy
+        qb = 2.0 * (px * vx + py * vy)
+        qc = px * px + py * py - R * R
+        for t in solve_quadratic(qa, qb, qc):
+            if t <= 1e-10:
+                continue
+            hx = x + t * vx
+            hy = y + t * vy
+            # Keep only the half of the circle that is actually a wall
+            if side > 0 and hx < a - 1e-12:
+                continue
+            if side < 0 and hx > -a + 1e-12:
+                continue
+            gx, gy = hx - arc_cx, hy
+            length = math.hypot(gx, gy)
+            if length < 1e-15:
+                continue
+            # Gradient points OUT of the board; the bounce needs the inward one
+            candidates.append((t, -gx / length, -gy / length))
+
+    if not candidates:
+        return None
+
+    t_min = min(item[0] for item in candidates)
+    near = [item for item in candidates if abs(item[0] - t_min) < 1e-9]
+    nx = sum(item[1] for item in near)
+    ny = sum(item[2] for item in near)
+    length = math.hypot(nx, ny)
+    if length < 1e-15:
+        return None
+    return (t_min, nx / length, ny / length)
+
+
 def next_board_hit(x, y, vx, vy, cfg: Config):
     if cfg.board_shape == "rectangle":
         return hit_rectangle_board(x, y, vx, vy, cfg)
     if cfg.board_shape == "circle":
         return hit_circle_board(x, y, vx, vy, cfg)
     if cfg.board_shape == "ellipse":
+        if board_is_radial(cfg):
+            # Dented: no closed form, fall back to the r(theta) ray marcher
+            return hit_polar_board(x, y, vx, vy, cfg)
         return hit_ellipse_board(x, y, vx, vy, cfg)
     if cfg.board_shape == "polar":
         return hit_polar_board(x, y, vx, vy, cfg)
+    if cfg.board_shape == "stadium":
+        return hit_stadium_board(x, y, vx, vy, cfg)
     raise ValueError("Unknown board_shape: " + str(cfg.board_shape))
 
 
@@ -1158,6 +1706,18 @@ def _draw_board_and_obstacle(canvas, cfg: Config, scale, cx, cy):
         x0, y0 = world_to_screen(-R, R, scale, cx, cy)
         x1, y1 = world_to_screen(R, -R, scale, cx, cy)
         canvas.create_oval(x0, y0, x1, y1, outline="black", width=2)
+    elif cfg.board_shape == "ellipse" and board_is_radial(cfg):
+        # Dented ellipse: no longer an oval, so sample r(theta) instead
+        pts = []
+        n = 480
+        for i in range(n + 1):
+            theta = 2.0 * math.pi * i / n
+            r = dented_ellipse_radius(theta, cfg)
+            sx, sy = world_to_screen(r * math.cos(theta), r * math.sin(theta),
+                                     scale, cx, cy)
+            pts.extend([sx, sy])
+        if len(pts) >= 4:
+            canvas.create_line(*pts, fill="black", width=2)
     elif cfg.board_shape == "ellipse":
         rx, ry = board_ellipse_radii(cfg)
         x0, y0 = world_to_screen(-rx, ry, scale, cx, cy)
@@ -1172,6 +1732,13 @@ def _draw_board_and_obstacle(canvas, cfg: Config, scale, cx, cy):
             r = polar_radius(theta, cfg)
             wx = r * math.cos(theta)
             wy = r * math.sin(theta)
+            sx, sy = world_to_screen(wx, wy, scale, cx, cy)
+            pts.extend([sx, sy])
+        if len(pts) >= 4:
+            canvas.create_line(*pts, fill="black", width=2)
+    elif cfg.board_shape == "stadium":
+        pts = []
+        for wx, wy in stadium_boundary_points(cfg):
             sx, sy = world_to_screen(wx, wy, scale, cx, cy)
             pts.extend([sx, sy])
         if len(pts) >= 4:
@@ -1580,8 +2147,8 @@ def interactive_edit_config(cfg: Config) -> Config:
     """Type new values in the terminal. Enter = keep current value."""
     print("\n--- Edit settings (press Enter to keep current) ---")
     cfg.board_shape = ask_str(
-        "Board shape (rectangle/circle/ellipse/polar)", cfg.board_shape,
-        allowed=["rectangle", "circle", "ellipse", "polar"],
+        "Board shape (rectangle/circle/ellipse/polar/stadium)", cfg.board_shape,
+        allowed=["rectangle", "circle", "ellipse", "polar", "stadium"],
     )
     # Side ratio only matters for a rectangular / elliptical board
     if cfg.board_shape == "rectangle":
@@ -1592,6 +2159,34 @@ def interactive_edit_config(cfg: Config) -> Config:
     elif cfg.board_shape == "ellipse":
         cfg.board_ratio = ask_float("Board radius ratio rx/ry", cfg.board_ratio)
         cfg.board_size = ask_float("Board vertical radius ry", cfg.board_size)
+        print("  Optional DENT, for perturbing away from an integrable board:")
+        print("    r(theta) = r_ellipse(theta) * (1 + bump * cos(n*theta))")
+        print("    bump = 0 keeps the ellipse exact (integrable, no chaos).")
+        print("    Small bump (0.01-0.1) is the interesting regime.")
+        cfg.ellipse_bump = ask_float("  Dent size bump (0 = none)", cfg.ellipse_bump)
+        if abs(cfg.ellipse_bump) > 0.0:
+            cfg.ellipse_bump_n = ask_int("  Dent harmonic n", cfg.ellipse_bump_n)
+    elif cfg.board_shape == "stadium":
+        # First the RECTANGLE, then how much the two ends bulge out.
+        print("  Stadium = a rectangle whose two short ends are replaced")
+        print("  by outward circular arcs. First give the rectangle:")
+        cfg.board_size = ask_float(
+            "  Half-height r (the rectangle's half-height)", cfg.board_size)
+        cfg.stadium_half_length = ask_float(
+            "  Half-length a of the STRAIGHT section", cfg.stadium_half_length)
+        print("  Now the LEVEL OF CURVING c (0 < c <= 1):")
+        print("    the cap bulges out by d = c * r past x = +/- a")
+        print("    c = 1    -> caps are exact SEMICIRCLES")
+        print("               = the classic BUNIMOVICH STADIUM (chaotic)")
+        print("    c small  -> shallow caps, nearly a rectangle")
+        print("    (for perfectly flat ends pick board_shape = rectangle)")
+        cfg.stadium_curve = ask_float("  Curving c", cfg.stadium_curve)
+        gamma = stadium_gamma(cfg)
+        print("  -> shape parameter gamma = a/r = {:.4f}".format(gamma))
+        print("     Literature (c = 1): the Lyapunov exponent peaks near")
+        print("     gamma = 1 and falls back to 0 as gamma -> 0")
+        print("     (gamma = 0 is just a circle, which is integrable).")
+        print("     At the peak: 0.94 per collision = 0.43 per unit length.")
     else:
         # Polar: r(θ) = r0 + a1 cosθ + b1 sinθ + a2 cos2θ + ...
         print("  Polar board: r(θ) = r0 + a1*cosθ + b1*sinθ")
@@ -1736,6 +2331,21 @@ SALI_DEFAULT_ANGLE_OFFSET_FRAC = 0.37
 # Total orbits per survey = SALI_DEFAULT_STARTS * SALI_DEFAULT_ANGLES.
 SALI_DEFAULT_STARTS = 8
 SALI_DEFAULT_ANGLES = 90
+
+# Lyapunov number / exponent (Benettin 1980). Same bounce-map Jacobian as SALI.
+#   lambda = (1/n) sum log(alpha_k)     # stretch per bounce, in log scale
+#   L      = exp(lambda)                # Lyapunov NUMBER: multiply nearby
+#                                       # errors by about L each bounce
+# SALI answers "is this orbit chaotic?". L answers "how FAST does it stretch?".
+# Regular orbits: L ~ 1 (lambda ~ 0). Chaotic: L > 1 (lambda > 0).
+# Unlike SALI, this must run the full bounce count (no early exit), because the
+# rate is an average over the whole orbit.
+LYAPUNOV_DEFAULT_BOUNCES = 500
+# Finite-time lambda below this is treated as "no exponential stretch".
+# After 500 bounces an empty ellipse/circle still sits around 0.01-0.015
+# (finite-time leftover + finite-difference Jacobian noise), while a
+# dispersing Sinai scatterer is typically 0.5-1. So 0.05 separates them.
+LYAPUNOV_REGULAR_THRESHOLD = 0.05
 
 
 @dataclass
@@ -2303,6 +2913,864 @@ def print_chaoticness_report(result: ChaoticnessResult):
 
 
 # =============================================================================
+# LYAPUNOV NUMBER  (how fast nearby paths stretch)
+# =============================================================================
+# Benettin algorithm on the same 2x2 bounce-map Jacobian SALI uses.
+#
+# After each bounce a tiny error vector w is multiplied by the Jacobian J and
+# then renormalized to length 1. The growth factor alpha = ||J w|| is the
+# stretch of that one bounce:
+#
+#   lambda  = (1/n) * sum log(alpha_k)     Lyapunov EXPONENT
+#   L       = exp(lambda)                  Lyapunov NUMBER
+#
+# L is the headline: nearby paths multiply their separation by about L per
+# bounce. L ~ 1 means regular; L > 1 means chaotic, and the larger L the
+# more violent the chaos. This is the STRENGTH number; keep SALI for the
+# fraction of the board that is chaotic.
+
+
+@dataclass
+class LyapunovOrbitResult:
+    """Lyapunov number of one start angle."""
+    angle_deg: float
+    exponent: float         # lambda; nan if the orbit failed
+    number: float           # L = exp(lambda); nan if failed
+    n_bounces_done: int
+    label: str              # "chaotic", "regular", or "failed"
+
+
+@dataclass
+class LyapunovSurveyResult:
+    """Mean Lyapunov number over many start angles at one start point."""
+    n_trials: int
+    n_ok: int
+    n_failed: int
+    mean_exponent: float    # arithmetic mean of lambda (KS-like)
+    mean_number: float      # exp(mean_exponent): geometric mean of L
+    min_exponent: float
+    max_exponent: float
+    n_bounces: int
+    stretch_threshold: float
+    start_x: float
+    start_y: float
+    orbits: list            # list of LyapunovOrbitResult
+
+
+def compute_lyapunov_for_angle(
+    cfg: Config,
+    angle_deg,
+    n_bounces=LYAPUNOV_DEFAULT_BOUNCES,
+    stretch_threshold=LYAPUNOV_REGULAR_THRESHOLD,
+):
+    """
+    Lyapunov number checker for one start angle.
+
+    Lands on the bounce section, then evolves one unit deviation vector with
+    the 2x2 section Jacobian for n_bounces collisions (Benettin). Returns
+
+        exponent = lambda = (1/n) sum log(alpha_k)
+        number   = L      = exp(lambda)
+
+    Label is "chaotic" if lambda > stretch_threshold, else "regular".
+    That cutoff is only a rough finite-time hint: use SALI for a yes/no
+    chaos classification, and this number for stretching strength.
+
+    Returns a LyapunovOrbitResult.
+    """
+    validate_start(cfg)
+    x = float(cfg.start_x)
+    y = float(cfg.start_y)
+    theta = math.radians(float(angle_deg))
+
+    first = _bounce_map_state(x, y, theta, cfg)
+    if first is None:
+        return LyapunovOrbitResult(
+            angle_deg=float(angle_deg),
+            exponent=float("nan"),
+            number=float("nan"),
+            n_bounces_done=0,
+            label="failed",
+        )
+    x, y, theta, nx, ny = first
+
+    # Generic unit error in (s, theta). Almost every start vector feels the
+    # largest Lyapunov exponent (Oseledets). The first few bounces only
+    # align w with the expanding direction, so they are not counted.
+    w = [1.0, 0.0]
+    log_sum = 0.0
+    counted = 0
+    done = 0
+    n_bounces = max(1, int(n_bounces))
+    burn = min(50, max(5, n_bounces // 10))
+
+    for _ in range(n_bounces):
+        mapped = _finite_diff_jacobian_2d(x, y, theta, nx, ny, cfg)
+        if mapped is None:
+            break
+        x, y, theta, nx, ny, J = mapped
+        w = _matvec2(J, w)
+        alpha = _norm2(w)
+        done += 1
+        if alpha < 1e-30:
+            # Numerically collapsed; restart so later bounces still count
+            w = [1.0, 0.0]
+            continue
+        w = [w[0] / alpha, w[1] / alpha]
+        if done > burn:
+            log_sum += math.log(alpha)
+            counted += 1
+
+    if done == 0:
+        return LyapunovOrbitResult(
+            angle_deg=float(angle_deg),
+            exponent=float("nan"),
+            number=float("nan"),
+            n_bounces_done=0,
+            label="failed",
+        )
+
+    if counted == 0:
+        counted = 1
+        # Orbit died during burn-in; fall back to "no stretch recorded"
+        log_sum = 0.0
+    exponent = log_sum / float(counted)
+    number = math.exp(exponent)
+    if exponent > float(stretch_threshold):
+        label = "chaotic"
+    else:
+        label = "regular"
+    return LyapunovOrbitResult(
+        angle_deg=float(angle_deg),
+        exponent=exponent,
+        number=number,
+        n_bounces_done=done,
+        label=label,
+    )
+
+
+def measure_lyapunov_at_start(
+    cfg: Config,
+    n_trials=1,
+    n_bounces=LYAPUNOV_DEFAULT_BOUNCES,
+    stretch_threshold=LYAPUNOV_REGULAR_THRESHOLD,
+    angle_start_deg=0.0,
+    angle_end_deg=360.0,
+    angle_offset_frac=SALI_DEFAULT_ANGLE_OFFSET_FRAC,
+    verbose=True,
+):
+    """
+    Lyapunov number at cfg.start_x / cfg.start_y.
+
+    n_trials=1 uses cfg.start_angle_deg. More trials sweep evenly spaced
+    start angles (same off-axis grid as the SALI survey) and report the mean
+    stretching rate at this start point.
+
+    The headline mean_number is exp(mean lambda), i.e. the geometric mean of
+    L. That is the right average for a multiplicative stretch factor.
+    """
+    n_trials = max(1, int(n_trials))
+    if n_trials == 1:
+        angles = [float(cfg.start_angle_deg)]
+    else:
+        span = float(angle_end_deg) - float(angle_start_deg)
+        if abs(span - 360.0) < 1e-9:
+            step = span / n_trials
+            shift = step * float(angle_offset_frac)
+            angles = [angle_start_deg + shift + step * i for i in range(n_trials)]
+        else:
+            angles = linspace(angle_start_deg, angle_end_deg, n_trials)
+
+    if verbose:
+        print(
+            "Lyapunov checker: {} angle(s), {} bounces/orbit, "
+            "stretch_threshold={:g}".format(
+                n_trials, n_bounces, stretch_threshold
+            )
+        )
+        print(
+            "  start=({:.4g}, {:.4g}), board={}, obstacle={}".format(
+                cfg.start_x, cfg.start_y, cfg.board_shape, cfg.obstacle_shape
+            )
+        )
+
+    orbits = []
+    n_failed = 0
+    for i, ang in enumerate(angles):
+        orbit = compute_lyapunov_for_angle(
+            cfg, ang, n_bounces=n_bounces,
+            stretch_threshold=stretch_threshold,
+        )
+        orbits.append(orbit)
+        if orbit.label == "failed":
+            n_failed += 1
+        if verbose and ((i + 1) % max(1, n_trials // 10) == 0 or i + 1 == n_trials):
+            print("  ... {}/{}  last L={:.4g} {} ({})".format(
+                i + 1, n_trials, orbit.number,
+                lyapunov_meaning(orbit.number), orbit.label))
+
+    ok = [o for o in orbits if o.label != "failed"]
+    n_ok = len(ok)
+    if n_ok == 0:
+        mean_exp = float("nan")
+        mean_num = float("nan")
+        min_exp = float("nan")
+        max_exp = float("nan")
+    else:
+        mean_exp = sum(o.exponent for o in ok) / float(n_ok)
+        mean_num = math.exp(mean_exp)
+        min_exp = min(o.exponent for o in ok)
+        max_exp = max(o.exponent for o in ok)
+
+    return LyapunovSurveyResult(
+        n_trials=n_trials,
+        n_ok=n_ok,
+        n_failed=n_failed,
+        mean_exponent=mean_exp,
+        mean_number=mean_num,
+        min_exponent=min_exp,
+        max_exponent=max_exp,
+        n_bounces=int(n_bounces),
+        stretch_threshold=float(stretch_threshold),
+        start_x=float(cfg.start_x),
+        start_y=float(cfg.start_y),
+        orbits=orbits,
+    )
+
+
+def lyapunov_meaning(number):
+    """
+    Short band name for a counted Lyapunov NUMBER L.
+
+    Converts L back to the exponent and defers to lyapunov_band(), so this
+    function and the chaos profile can never disagree about the same board.
+    The band edges live in one place only: LYAPUNOV_BANDS.
+    """
+    if number != number or number <= 0.0:   # NaN or nonsense
+        return "failed"
+    return lyapunov_band(math.log(number))
+
+
+def print_lyapunov_l_key():
+    """One-line reminder printed next to every counted L."""
+    parts = []
+    lo = 0.0
+    for edge, name in LYAPUNOV_BANDS:
+        if edge == float("inf"):
+            parts.append("L>{:.2f} {}".format(math.exp(lo), name))
+        else:
+            parts.append("L {:.2f}-{:.2f} {}".format(
+                math.exp(lo), math.exp(edge), name))
+        lo = edge
+    print("L key:  " + " | ".join(parts))
+    print("        (bands are set by published lambda values; see command 9)")
+
+
+def print_lyapunov_orbit_report(result: LyapunovOrbitResult):
+    """Print one-orbit Lyapunov number (TAB-friendly)."""
+    print("\n--- Lyapunov number (one orbit) ---")
+    print("start_angle_deg\t{}".format(result.angle_deg))
+    print("n_bounces_done\t{}".format(result.n_bounces_done))
+    print("label\t{}".format(result.label))
+    if result.label == "failed":
+        print("lyapunov_exponent\tnan")
+        print("lyapunov_number\tnan")
+        return
+    print("lyapunov_exponent\t{:.6f}".format(result.exponent))
+    print("lyapunov_number\t{:.6f}\t{}".format(
+        result.number, lyapunov_meaning(result.number)))
+    print_lyapunov_l_key()
+    if result.label == "regular":
+        print("reading\tL ~ 1: nearby paths do not stretch exponentially")
+    else:
+        print(
+            "reading\t{}: nearby paths multiply their separation by about "
+            "{:.3f} each bounce".format(
+                lyapunov_meaning(result.number), result.number
+            )
+        )
+
+
+def print_lyapunov_survey_report(result: LyapunovSurveyResult):
+    """Print a multi-angle Lyapunov summary (TAB-friendly)."""
+    print("\n--- Lyapunov number (angle survey at this start) ---")
+    print("start_x\t{}".format(result.start_x))
+    print("start_y\t{}".format(result.start_y))
+    print("n_trials\t{}".format(result.n_trials))
+    print("n_bounces\t{}".format(result.n_bounces))
+    print("stretch_threshold\t{:g}".format(result.stretch_threshold))
+    print("n_ok\t{}".format(result.n_ok))
+    print("n_failed\t{}".format(result.n_failed))
+    if result.n_ok == 0:
+        print("lyapunov_exponent_mean\tnan")
+        print("lyapunov_number_mean\tnan")
+        return
+    print("lyapunov_exponent_mean\t{:.6f}".format(result.mean_exponent))
+    print("lyapunov_number_mean\t{:.6f}\t{}".format(
+        result.mean_number, lyapunov_meaning(result.mean_number)))
+    print("lyapunov_exponent_min\t{:.6f}".format(result.min_exponent))
+    print("lyapunov_exponent_max\t{:.6f}".format(result.max_exponent))
+    print_lyapunov_l_key()
+    if result.mean_exponent <= result.stretch_threshold:
+        print("reading\tL ~ 1: little or no exponential stretching here")
+    else:
+        print(
+            "reading\t{}: mean stretch factor L = {:.3f} per bounce "
+            "(bigger L = more violent chaos)".format(
+                lyapunov_meaning(result.mean_number), result.mean_number
+            )
+        )
+    print("\nper angle:")
+    print("angle_deg\texponent\tnumber\tmeaning\tlabel\tbounces")
+    for o in result.orbits:
+        print("{:.4f}\t{:.6f}\t{:.6f}\t{}\t{}\t{}".format(
+            o.angle_deg, o.exponent, o.number,
+            lyapunov_meaning(o.number), o.label, o.n_bounces_done))
+    print_lyapunov_l_key()
+
+
+# =============================================================================
+# COMBINED CHAOS PROFILE  (SALI fraction + Lyapunov strength)
+# =============================================================================
+# One board gets TWO numbers, because neither one alone describes a board:
+#
+#   1) SALI chaotic fraction  = HOW MUCH of the board is chaotic (0 .. 1)
+#   2) Lyapunov exponent      = HOW HARD that chaotic part stretches
+#
+# The Lyapunov average is taken over the orbits SALI called CHAOTIC only.
+# Mixing regular orbits (lambda ~ 0) into the mean would blur "half the table
+# is wild" together with "the whole table is mildly messy" - exactly the case
+# the two-parameter split exists to separate.
+#
+# BAND EDGES ARE TAKEN FROM PUBLISHED PER-COLLISION VALUES.
+# Boards marked [BUILDABLE] can be reproduced in this program, so they are the
+# ones worth checking against. The others only fix the SCALE of a band.
+#
+#   lambda = 0        integrable boards, exact                     [BUILDABLE]
+#                     circle, ellipse, rectangle
+#   lambda = 0.94     Bunimovich stadium, MAXIMUM over shape, at a/r = 1
+#                     [Benettin & Strelcyn, Phys. Rev. A 17 (1978) 773;
+#                      reproduced in Sci. Rep. 12 (2022) 4787]  [BUILDABLE]
+#                     CAREFUL: those papers quote 0.43 PER UNIT LENGTH, not
+#                     per collision. Converting with the exact mean free path
+#                     of a 2D billiard, <l> = pi * Area / Perimeter = 2.1818
+#                     at a = r, gives 0.43 * 2.1818 = 0.94 per collision.
+#                     Measured here: 0.940 per collision = 0.4308 per unit
+#                     length, i.e. the published value.
+#                     -> board_shape = "stadium", stadium_curve = 1, a = r
+#   lambda = 0.653    cardioid r = 1 + cos(theta), h_KS            [BUILDABLE]
+#                     [Baecker & Dullin, J. Phys. A 30 (1997) 1991, eq. (59)]
+#                     -> polar with r0 = 1, a1 = 1. Measured here: 0.646.
+#   lambda = 0.665    same cardioid, independent measurement       [BUILDABLE]
+#                     [arXiv:2408.04052, Table 1]
+#   lambda = 0.805    Sinai billiard                [arXiv:2408.04052, Table 1]
+#                     Partly buildable: rectangle + circular obstacle, but the
+#                     paper does not state its box/disk sizes.
+#   lambda = 1.70 .. 4.48   Sinai billiard PER SCATTERER COLLISION for disk
+#                     radius R = 0.40 .. 0.10 of the cell, from the exact law
+#                     lambda = -2 log R - 0.1284                   [BUILDABLE]
+#                     [Dahlqvist, Nonlinearity 10 (1997), article 011, eq. (74)]
+#                     -> square board + centred disk, but this law counts only
+#                     scatterer hits, so rescale by n_total/n_scatterer.
+#
+# So the bands below are: nothing / weak / below the cardioid /
+# cardioid-to-stadium range / dispersing-Sinai range.
+LYAPUNOV_BANDS = (
+    (0.05, "regular"),
+    (0.30, "slightly chaotic"),
+    (0.60, "moderate chaos"),
+    (1.10, "strong chaos"),
+    (float("inf"), "violent chaos"),
+)
+
+# Printed with every profile so the numbers are never read without context.
+# The last column says whether THIS program can build the board, because some
+# anchors only fix the scale of a band and are not boards you can reproduce
+# here. The stadium USED to be in that group; board_shape = "stadium" now
+# builds it, so it is a live check rather than just a scale marker.
+#
+# Every lambda below is PER COLLISION, which is what this program measures.
+# Papers are split on the convention: some quote per unit length (per unit
+# time, since speed = 1). Converting needs the mean free path, which for any
+# 2D billiard is <l> = pi * Area / Perimeter:
+#       lambda_per_collision = lambda_per_length * <l>
+# The stadium row below is converted that way. Ignoring this is the single
+# easiest way to be wrong by a factor of 2 or more.
+LYAPUNOV_REFERENCE_TABLE = (
+    ("0.00", "circle / ellipse / rectangle (integrable)", "exact",
+     "yes: board_shape=circle/ellipse/rectangle"),
+    ("0.653", "cardioid r = 1 + cos(theta)", "Baecker & Dullin 1997",
+     "yes: polar, r0=1, a1=1"),
+    ("0.665", "cardioid, independent value", "arXiv:2408.04052",
+     "yes: same board as above"),
+    ("0.805", "Sinai billiard", "arXiv:2408.04052",
+     "partly: rectangle+circle, their exact sizes unstated"),
+    ("0.94", "stadium, max over shape (a/r = 1)",
+     "Benettin & Strelcyn 1978 (their 0.43 per unit LENGTH x <l>=2.18)",
+     "yes: stadium, curve=1, a=r"),
+    ("1.70-4.48", "Sinai per scatterer hit, R = 0.40..0.10",
+     "Dahlqvist 1997",
+     "yes: square+centred disk, but rescale to scatterer hits"),
+)
+
+
+def lyapunov_band(exponent):
+    """
+    Literature-anchored name for a per-collision Lyapunov exponent.
+
+    See LYAPUNOV_BANDS above for where each edge comes from.
+    """
+    if exponent != exponent:            # NaN
+        return "no chaotic orbits"
+    for edge, name in LYAPUNOV_BANDS:
+        if exponent < edge:
+            return name
+    return LYAPUNOV_BANDS[-1][1]
+
+
+@dataclass
+class ChaosProfile:
+    """Both chaos parameters for one board, measured on one angle sweep."""
+    board_shape: str
+    obstacle_shape: str
+    start_x: float
+    start_y: float
+    n_angles: int
+    n_bounces: int
+
+    # ---- parameter 1: SALI, how MUCH of the board is chaotic ----
+    chaotic_fraction: float
+    n_chaotic: int
+    n_regular: int
+    n_failed: int
+
+    # ---- parameter 2: Lyapunov, how HARD the chaotic part stretches ----
+    lyap_exponent: float        # mean lambda over the SALI-chaotic orbits
+    lyap_number: float          # L = exp(lyap_exponent)
+    lyap_sem: float             # standard error of that mean
+    lyap_min: float
+    lyap_max: float
+    lyap_on_regular: float      # same average over the REGULAR orbits (~0)
+    band: str                   # literature band name for lyap_exponent
+
+    # ---- combined ----
+    ks_estimate: float          # fraction * lambda_sea, entropy-like
+    orbits: list                # (angle_deg, sali_label, exponent, number)
+
+    @property
+    def verdict(self):
+        """One-line reading of the two parameters together."""
+        if self.n_chaotic == 0:
+            return "fully regular (integrable): no chaotic directions found"
+        if self.chaotic_fraction >= 0.98:
+            return "fully chaotic (ergodic-looking), strength: " + self.band
+        if self.chaotic_fraction <= 0.02:
+            return "essentially regular with a negligible chaotic trace"
+        return "MIXED phase space ({:.0f}% chaotic), strength: {}".format(
+            100.0 * self.chaotic_fraction, self.band)
+
+
+def analyse_chaos(
+    cfg: Config,
+    n_angles=SALI_DEFAULT_TRIALS,
+    n_bounces=SALI_DEFAULT_BOUNCES,
+    sali_threshold=SALI_DEFAULT_THRESHOLD,
+    persist=SALI_DEFAULT_PERSIST,
+    angle_offset_frac=SALI_DEFAULT_ANGLE_OFFSET_FRAC,
+    verbose=True,
+):
+    """
+    Analyse a board with BOTH chaos parameters on the SAME set of orbits.
+
+    Sweeps n_angles start directions (default 360, i.e. one per degree) from
+    cfg.start_x / cfg.start_y. For every angle it runs:
+
+      - SALI          -> is this orbit chaotic or regular?
+      - Lyapunov      -> how fast do nearby paths stretch on it?
+
+    and returns a ChaosProfile holding
+
+      chaotic_fraction  = chaotic angles / classified angles      (0 .. 1)
+      lyap_exponent     = mean lambda over the CHAOTIC angles only
+      band              = literature band name for that lambda
+
+    Reading the two together:
+      fraction low  + lambda n/a   -> regular board
+      fraction ~1   + lambda large -> fully chaotic, and this is how hard
+      fraction mid  + lambda large -> mixed: islands of calm in a violent sea
+
+    Returns a ChaosProfile.
+    """
+    validate_start(cfg)
+    n_angles = max(1, int(n_angles))
+    n_bounces = max(1, int(n_bounces))
+
+    # Off-axis angle grid: a grid starting exactly at 0 deg would sample the
+    # symmetry directions (0/90/180/270) where measure-zero special orbits
+    # live. See SALI_DEFAULT_ANGLE_OFFSET_FRAC.
+    step = 360.0 / n_angles
+    angles = [step * (i + float(angle_offset_frac)) for i in range(n_angles)]
+
+    if verbose:
+        print("Chaos profile: {} angles x {} bounces from ({:.4g}, {:.4g})"
+              .format(n_angles, n_bounces, cfg.start_x, cfg.start_y))
+        print("  board={}, obstacle={}".format(
+            cfg.board_shape, cfg.obstacle_shape))
+
+    orbits = []
+    chaotic_lams = []
+    regular_lams = []
+    n_chaotic = n_regular = n_failed = 0
+
+    for i, ang in enumerate(angles):
+        sali = compute_sali_for_angle(
+            cfg, ang, n_bounces=n_bounces,
+            threshold=sali_threshold, persist=persist,
+        )
+        lyap = compute_lyapunov_for_angle(cfg, ang, n_bounces=n_bounces)
+        orbits.append((ang, sali.label, lyap.exponent, lyap.number))
+
+        if sali.label == "chaotic":
+            n_chaotic += 1
+            if lyap.label != "failed":
+                chaotic_lams.append(lyap.exponent)
+        elif sali.label == "regular":
+            n_regular += 1
+            if lyap.label != "failed":
+                regular_lams.append(lyap.exponent)
+        else:
+            n_failed += 1
+
+        if verbose and ((i + 1) % max(1, n_angles // 10) == 0
+                        or i + 1 == n_angles):
+            print("  ... {}/{}  chaotic={} regular={} failed={}".format(
+                i + 1, n_angles, n_chaotic, n_regular, n_failed))
+
+    classified = n_chaotic + n_regular
+    fraction = (n_chaotic / classified) if classified > 0 else 0.0
+
+    if chaotic_lams:
+        mean_lam = sum(chaotic_lams) / len(chaotic_lams)
+        if len(chaotic_lams) > 1:
+            var = sum((v - mean_lam) ** 2 for v in chaotic_lams) \
+                / (len(chaotic_lams) - 1)
+            sem = math.sqrt(var / len(chaotic_lams))
+        else:
+            sem = 0.0
+        lam_min = min(chaotic_lams)
+        lam_max = max(chaotic_lams)
+        number = math.exp(mean_lam)
+    else:
+        mean_lam = float("nan")
+        sem = float("nan")
+        lam_min = float("nan")
+        lam_max = float("nan")
+        number = float("nan")
+
+    on_regular = (sum(regular_lams) / len(regular_lams)) \
+        if regular_lams else float("nan")
+
+    return ChaosProfile(
+        board_shape=str(cfg.board_shape),
+        obstacle_shape=str(cfg.obstacle_shape),
+        start_x=float(cfg.start_x),
+        start_y=float(cfg.start_y),
+        n_angles=n_angles,
+        n_bounces=n_bounces,
+        chaotic_fraction=fraction,
+        n_chaotic=n_chaotic,
+        n_regular=n_regular,
+        n_failed=n_failed,
+        lyap_exponent=mean_lam,
+        lyap_number=number,
+        lyap_sem=sem,
+        lyap_min=lam_min,
+        lyap_max=lam_max,
+        lyap_on_regular=on_regular,
+        band=lyapunov_band(mean_lam),
+        ks_estimate=(fraction * mean_lam) if chaotic_lams else 0.0,
+        orbits=orbits,
+    )
+
+
+def print_lyapunov_disclaimer(n_bounces=None):
+    """
+    The benchmark disclaimer: what the Lyapunov bands mean and where the
+    numbers behind them come from. Printed with every chaos profile.
+    """
+    print("\n--- how to read the Lyapunov number (benchmarks) ---")
+    print("lambda is the average log-stretch PER COLLISION; L = exp(lambda)")
+    print("is the factor by which two nearby paths separate each bounce.")
+    print()
+    print("band\tlambda range\tL range")
+    lo = 0.0
+    for edge, name in LYAPUNOV_BANDS:
+        hi = "inf" if edge == float("inf") else "{:.2f}".format(edge)
+        hi_l = "inf" if edge == float("inf") else "{:.2f}".format(math.exp(edge))
+        print("{}\t{:.2f} - {}\t{:.2f} - {}".format(
+            name, lo, hi, math.exp(lo), hi_l))
+        lo = edge
+    print()
+    print("published per-collision values the bands are anchored to:")
+    print("lambda\tsystem\tsource\tbuildable in this program?")
+    for value, system, source, buildable in LYAPUNOV_REFERENCE_TABLE:
+        print("{}\t{}\t{}\t{}".format(value, system, source, buildable))
+    print()
+    print("DISCLAIMER: these are FINITE-TIME estimates, not proofs.")
+    print("  - lambda is averaged per COLLISION (not per unit time), which is")
+    print("    the convention every value above uses.")
+    print("  - it counts EVERY collision, walls included. Papers on the Sinai")
+    print("    billiard often count only scatterer hits, which makes their")
+    print("    lambda larger by n_total/n_scatterer (a factor of ~7 for a")
+    print("    small disk). Compare like with like.")
+    print("  - a regular orbit never reaches exactly 0: it decays like")
+    print("    log(n)/n, so short runs read slightly positive.")
+    if n_bounces:
+        floor = math.log(n_bounces) / n_bounces
+        print("    at n_bounces={} that floor is about {:.4f}{}".format(
+            n_bounces, floor,
+            "  <-- ABOVE the regular band edge, raise n_bounces"
+            if floor > LYAPUNOV_BANDS[0][0] else ""))
+
+
+def print_chaos_profile(profile: ChaosProfile, show_angles=False):
+    """Print the two-parameter chaos profile (TAB-separated for Sheets)."""
+    print("\n--- CHAOS PROFILE: 2 parameters ---")
+    print("board_shape\t{}".format(profile.board_shape))
+    print("obstacle_shape\t{}".format(profile.obstacle_shape))
+    print("start_x\t{:.6f}".format(profile.start_x))
+    print("start_y\t{:.6f}".format(profile.start_y))
+    print("n_angles\t{}".format(profile.n_angles))
+    print("n_bounces\t{}".format(profile.n_bounces))
+
+    print("\n[1] SALI - how MUCH of the board is chaotic")
+    print("n_chaotic\t{}".format(profile.n_chaotic))
+    print("n_regular\t{}".format(profile.n_regular))
+    print("n_failed\t{}".format(profile.n_failed))
+    print("CHAOTIC_FRACTION\t{:.6f}\t({:.2f}%)".format(
+        profile.chaotic_fraction, 100.0 * profile.chaotic_fraction))
+
+    print("\n[2] LYAPUNOV - how HARD the chaotic part stretches")
+    print("     (averaged over the SALI-chaotic orbits only)")
+    if profile.n_chaotic == 0 or profile.lyap_exponent != profile.lyap_exponent:
+        print("LYAPUNOV_EXPONENT\tn/a\t(no chaotic orbits to average)")
+        print("LYAPUNOV_NUMBER\tn/a")
+    else:
+        print("LYAPUNOV_EXPONENT\t{:.6f}\t+/- {:.6f}".format(
+            profile.lyap_exponent, profile.lyap_sem))
+        print("LYAPUNOV_NUMBER\t{:.6f}".format(profile.lyap_number))
+        print("BAND\t{}".format(profile.band))
+        print("lambda_min\t{:.6f}".format(profile.lyap_min))
+        print("lambda_max\t{:.6f}".format(profile.lyap_max))
+    if profile.lyap_on_regular == profile.lyap_on_regular:
+        print("lambda_on_regular_orbits\t{:.6f}\t(sanity check, should be ~0)"
+              .format(profile.lyap_on_regular))
+
+    print("\n[1+2] combined")
+    print("ks_entropy_estimate\t{:.6f}\t(fraction * lambda)".format(
+        profile.ks_estimate))
+    print("VERDICT\t{}".format(profile.verdict))
+
+    if show_angles:
+        print("\nper angle:")
+        print("angle_deg\tsali_label\tlambda\tL")
+        for ang, label, exponent, number in profile.orbits:
+            print("{:.4f}\t{}\t{:.6f}\t{:.6f}".format(
+                ang, label, exponent, number))
+
+    print_lyapunov_disclaimer(profile.n_bounces)
+
+
+# =============================================================================
+# PHASE-SPACE CHAOS PROFILE (unbiased sampling, for MIXED boards)
+# =============================================================================
+
+@dataclass
+class PhaseSpaceProfile:
+    """Chaos measured on a uniform (s, p) grid instead of one start point."""
+    board_shape: str
+    obstacle_shape: str
+    n_s: int
+    n_p: int
+    n_bounces: int
+    perimeter: float
+
+    chaotic_fraction: float     # now a REAL fraction of phase space
+    n_chaotic: int
+    n_regular: int
+    n_failed: int
+
+    lyap_exponent: float        # mean lambda over the chaotic samples
+    lyap_number: float
+    lyap_sem: float
+    band: str
+    ks_estimate: float
+
+    # (s, p, sali_label, lambda) per sample - the phase-space portrait
+    samples: list
+
+    @property
+    def verdict(self) -> str:
+        f = self.chaotic_fraction
+        if self.n_chaotic == 0:
+            return "regular: no chaotic orbits anywhere in phase space"
+        if f >= 0.99:
+            return "fully chaotic (ergodic): {}".format(self.band)
+        if f <= 0.01:
+            return "essentially regular, with a negligible chaotic layer"
+        return ("MIXED: {:.1f}% of phase space is chaotic, and that part is {}"
+                .format(100.0 * f, self.band))
+
+
+def analyse_chaos_phase_space(
+    cfg: Config,
+    n_s=24,
+    n_p=15,
+    n_bounces=SALI_DEFAULT_BOUNCES,
+    sali_threshold=SALI_DEFAULT_THRESHOLD,
+    persist=SALI_DEFAULT_PERSIST,
+    verbose=True,
+):
+    """
+    Same two parameters as analyse_chaos, but sampled over the whole phase
+    space instead of along one curve through it.
+
+    Every sample is a point of a uniform n_s x n_p grid in Birkhoff
+    coordinates, in which the bounce map preserves ds dp - so the chaotic
+    fraction returned here really is the fraction of phase space that is
+    chaotic, and can be compared between boards and against published values.
+
+    Use this rather than analyse_chaos whenever the answer of interest is HOW
+    MUCH of the board is chaotic, which is the whole question on a mixed board.
+
+    Returns a PhaseSpaceProfile.
+    """
+    validate_start(cfg)
+    grid = sample_birkhoff_grid(cfg, n_s=n_s, n_p=n_p)
+    if not grid:
+        raise ValueError(
+            "No usable start states on this board: every (s, p) sample landed "
+            "outside the board or inside the obstacle."
+        )
+
+    if verbose:
+        print("Phase-space chaos profile: {} x {} = {} usable states x {} bounces"
+              .format(n_s, n_p, len(grid), n_bounces))
+        print("  board={}, obstacle={}, wall length L={:.4f}".format(
+            cfg.board_shape, cfg.obstacle_shape, boundary_perimeter(cfg)))
+
+    probe = copy.deepcopy(cfg)
+    samples = []
+    chaotic_lams = []
+    n_chaotic = n_regular = n_failed = 0
+
+    for k, (s, p, sx, sy, ang) in enumerate(grid):
+        probe.start_x, probe.start_y = sx, sy
+        probe.start_angle_deg = ang
+        try:
+            sali = compute_sali_for_angle(
+                probe, ang, n_bounces=n_bounces,
+                threshold=sali_threshold, persist=persist,
+            )
+            lyap = compute_lyapunov_for_angle(probe, ang, n_bounces=n_bounces)
+        except ValueError:
+            n_failed += 1
+            continue
+
+        samples.append((s, p, sali.label, lyap.exponent))
+        if sali.label == "chaotic":
+            n_chaotic += 1
+            if lyap.label != "failed":
+                chaotic_lams.append(lyap.exponent)
+        elif sali.label == "regular":
+            n_regular += 1
+        else:
+            n_failed += 1
+
+        if verbose and ((k + 1) % max(1, len(grid) // 10) == 0
+                        or k + 1 == len(grid)):
+            print("  ... {}/{}  chaotic={} regular={} failed={}".format(
+                k + 1, len(grid), n_chaotic, n_regular, n_failed))
+
+    classified = n_chaotic + n_regular
+    fraction = (n_chaotic / classified) if classified else 0.0
+
+    if chaotic_lams:
+        mean_lam = sum(chaotic_lams) / len(chaotic_lams)
+        if len(chaotic_lams) > 1:
+            var = sum((v - mean_lam) ** 2 for v in chaotic_lams) \
+                / (len(chaotic_lams) - 1)
+            sem = math.sqrt(var / len(chaotic_lams))
+        else:
+            sem = 0.0
+        number = math.exp(mean_lam)
+        band = lyapunov_band(mean_lam)
+    else:
+        mean_lam = sem = number = float("nan")
+        band = "no chaotic orbits"
+
+    ks = fraction * mean_lam if mean_lam == mean_lam else 0.0
+
+    return PhaseSpaceProfile(
+        board_shape=cfg.board_shape,
+        obstacle_shape=cfg.obstacle_shape,
+        n_s=int(n_s), n_p=int(n_p), n_bounces=int(n_bounces),
+        perimeter=boundary_perimeter(cfg),
+        chaotic_fraction=fraction,
+        n_chaotic=n_chaotic, n_regular=n_regular, n_failed=n_failed,
+        lyap_exponent=mean_lam, lyap_number=number, lyap_sem=sem,
+        band=band, ks_estimate=ks, samples=samples,
+    )
+
+
+def print_phase_space_profile(profile: PhaseSpaceProfile, show_map=True):
+    """Print the phase-space profile, with an ASCII portrait of (s, p)."""
+    print("\n--- PHASE-SPACE CHAOS PROFILE (uniform Birkhoff sampling) ---")
+    print("board_shape\t{}".format(profile.board_shape))
+    print("obstacle_shape\t{}".format(profile.obstacle_shape))
+    print("grid\t{} x {}\t(s x p)".format(profile.n_s, profile.n_p))
+    print("n_bounces\t{}".format(profile.n_bounces))
+    print("wall_length_L\t{:.6f}".format(profile.perimeter))
+
+    print("\n[1] SALI - fraction of PHASE SPACE that is chaotic")
+    print("n_chaotic\t{}".format(profile.n_chaotic))
+    print("n_regular\t{}".format(profile.n_regular))
+    print("n_failed\t{}".format(profile.n_failed))
+    print("CHAOTIC_FRACTION\t{:.6f}\t({:.2f}%)".format(
+        profile.chaotic_fraction, 100.0 * profile.chaotic_fraction))
+
+    print("\n[2] LYAPUNOV - how hard the chaotic part stretches")
+    if profile.lyap_exponent != profile.lyap_exponent:
+        print("LYAPUNOV_EXPONENT\tn/a\t(no chaotic orbits to average)")
+    else:
+        print("LYAPUNOV_EXPONENT\t{:.6f}\t+/- {:.6f}".format(
+            profile.lyap_exponent, profile.lyap_sem))
+        print("LYAPUNOV_NUMBER\t{:.6f}".format(profile.lyap_number))
+        print("BAND\t{}".format(profile.band))
+
+    print("\nks_entropy_estimate\t{:.6f}\t(fraction * lambda)".format(
+        profile.ks_estimate))
+    print("VERDICT\t{}".format(profile.verdict))
+
+    if show_map and profile.samples:
+        print("\nphase-space portrait:  '#' chaotic   '.' regular   '?' unclear")
+        print("  rows = p = sin(angle from the wall normal), top row is p=+1")
+        print("  cols = s = position along the wall")
+        cell = {}
+        for s, p, label, _lam in profile.samples:
+            i = min(profile.n_s - 1,
+                    int(profile.n_s * s / max(1e-15, profile.perimeter)))
+            j = min(profile.n_p - 1, int(profile.n_p * (p + 1.0) / 2.0))
+            cell[(i, j)] = {"chaotic": "#", "regular": "."}.get(label, "?")
+        for j in range(profile.n_p - 1, -1, -1):
+            p_mid = -1.0 + 2.0 * (j + 0.5) / profile.n_p
+            row = "".join(cell.get((i, j), " ") for i in range(profile.n_s))
+            print("  p={:+.2f} |{}|".format(p_mid, row))
+
+    print_lyapunov_disclaimer(profile.n_bounces)
+
+
+# =============================================================================
 # MAIN MENU
 # =============================================================================
 
@@ -2322,11 +3790,16 @@ def main():
     print("  5  = print current settings")
     print("  6  = measure board CHAOTICNESS + SPREAD (SALI survey)")
     print("  7  = compare START POSITIONS (several paths on one picture)")
+    print("  8  = measure LYAPUNOV number (how FAST nearby paths stretch)")
+    print("  9  = CHAOS PROFILE: both parameters at once (SALI + Lyapunov)")
+    print("  10 = PHASE-SPACE PROFILE: same two numbers sampled over the WHOLE")
+    print("       phase space, plus a map of the regular islands (use for MIXED)")
     print("  q  = quit")
     print("=" * 60)
 
     while True:
-        choice = input("\nChoose command [1/2/3/4/5/6/7/q]: ").strip().lower()
+        choice = input(
+            "\nChoose command [1/2/3/4/5/6/7/8/9/10/q]: ").strip().lower()
 
         if choice == "q":
             print("Bye!")
@@ -2409,8 +3882,67 @@ def main():
                 save_results_to_csv(all_results, cfg.save_csv_file)
             plot_multi_start(multi_results, cfg)
 
+        elif choice == "8":
+            print("Lyapunov number checker. SALI (command 6) tells HOW MUCH")
+            print("of the board is chaotic; this tells HOW FAST nearby paths")
+            print("stretch. L ~ 1 is regular; bigger L = more violent chaos.")
+            nb = ask_int("Bounces per orbit", LYAPUNOV_DEFAULT_BOUNCES)
+            n_ang = ask_int(
+                "How many start angles (1 = current angle only)", 1
+            )
+            try:
+                if n_ang <= 1:
+                    orbit = compute_lyapunov_for_angle(
+                        cfg, cfg.start_angle_deg, n_bounces=nb
+                    )
+                    print_lyapunov_orbit_report(orbit)
+                else:
+                    survey = measure_lyapunov_at_start(
+                        cfg, n_trials=n_ang, n_bounces=nb, verbose=True
+                    )
+                    print_lyapunov_survey_report(survey)
+            except ValueError as err:
+                print("ERROR:", err)
+                continue
+
+        elif choice == "9":
+            print("CHAOS PROFILE - the full answer in two numbers:")
+            print("  [1] SALI chaotic fraction = HOW MUCH of the board is chaotic")
+            print("  [2] Lyapunov exponent     = HOW HARD that chaos stretches")
+            print("Both are measured on the same angle sweep, and the Lyapunov")
+            print("average uses only the orbits SALI called chaotic.")
+            n_ang = ask_int("How many start angles", SALI_DEFAULT_TRIALS)
+            nb = ask_int("Bounces per orbit", SALI_DEFAULT_BOUNCES)
+            try:
+                profile = analyse_chaos(
+                    cfg, n_angles=n_ang, n_bounces=nb, verbose=True
+                )
+            except ValueError as err:
+                print("ERROR:", err)
+                continue
+            print_chaos_profile(profile)
+
+        elif choice == "10":
+            print("PHASE-SPACE PROFILE - the same two numbers, sampled honestly.")
+            print("Command 9 fires angles from ONE point, which traces a single")
+            print("curve through a 2-D phase space. This spreads the start states")
+            print("uniformly over the WHOLE phase space (Birkhoff s and p), so the")
+            print("chaotic fraction is a real fraction of phase space.")
+            print("Use this one for MIXED boards, and to see the regular islands.")
+            n_s = ask_int("Grid steps along the wall (s)", 24)
+            n_p = ask_int("Grid steps in angle (p)", 15)
+            nb = ask_int("Bounces per orbit", SALI_DEFAULT_BOUNCES)
+            try:
+                profile = analyse_chaos_phase_space(
+                    cfg, n_s=n_s, n_p=n_p, n_bounces=nb, verbose=True
+                )
+            except ValueError as err:
+                print("ERROR:", err)
+                continue
+            print_phase_space_profile(profile)
+
         else:
-            print("Unknown command. Use 1, 2, 3, 4, 5, 6, 7, 8, or q.")
+            print("Unknown command. Use 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, or q.")
 
 
 # Run the menu only when you execute this file directly:
